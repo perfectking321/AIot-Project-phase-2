@@ -1,0 +1,7 @@
+Identify technical challenges, code for performance metrics, for example: student academic metrics are different from sports metrics, so seperate metrics for different section, representing of graph should be there
+One line about the generic, the cause, what motivats us to take this problem statement
+
+[10:30 pm, 06/04/2026] Iyad: te of art: what is the challenege and limitations of existing solution, drawbacks of existing solutions
+[10:30 pm, 06/04/2026] Iyad: Why using this methodology? Just write 1-2 lines in lamen language
+[10:30 pm, 06/04/2026] Iyad: Finally the conclusion: main findings…
+[10:30 pm, 06/04/2026] Iyad: Introduction: first write the problem statement 1st line: write numbers:80% of this that happened etc….
