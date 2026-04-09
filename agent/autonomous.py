@@ -18,7 +18,7 @@ from config import config
 logger = logging.getLogger("voxcode.autonomous")
 
 
-class AgentState(Enum):
+class AutonomousAgentState(Enum):
     IDLE = "idle"
     PERCEIVING = "perceiving"
     THINKING = "thinking"
@@ -52,7 +52,7 @@ class Thought:
 
 
 @dataclass
-class ActionResult:
+class AutonomousActionResult:
     """Result of executing an action."""
     success: bool
     message: str
@@ -147,7 +147,7 @@ ALWAYS explain your reasoning before acting.
         self.on_step = on_step or (lambda n, msg, status: None)
 
         # State
-        self.state = AgentState.IDLE
+        self.state = AutonomousAgentState.IDLE
         self.current_goal = ""
         self.history: List[Dict] = []  # Current task history
         self.max_cycles = 15  # Max perception-action cycles
@@ -216,7 +216,7 @@ ALWAYS explain your reasoning before acting.
         """
         self.current_goal = command
         self.history = []
-        self.state = AgentState.PERCEIVING
+        self.state = AutonomousAgentState.PERCEIVING
         self._stop_requested = False  # Reset stop flag
 
         logger.info(f"Processing command: {command}")
@@ -230,11 +230,11 @@ ALWAYS explain your reasoning before acting.
 
         # Autonomous ReAct loop
         cycle = 0
-        while cycle < self.max_cycles and self.state not in [AgentState.COMPLETE, AgentState.FAILED]:
+        while cycle < self.max_cycles and self.state not in [AutonomousAgentState.COMPLETE, AutonomousAgentState.FAILED]:
             # Check for stop request
             if self._stop_requested:
                 logger.info("Agent stopped by request")
-                self.state = AgentState.FAILED
+                self.state = AutonomousAgentState.FAILED
                 return "Stopped by user"
 
             cycle += 1
@@ -242,29 +242,29 @@ ALWAYS explain your reasoning before acting.
 
             try:
                 # 1. PERCEIVE - Understand current screen state
-                self.state = AgentState.PERCEIVING
+                self.state = AutonomousAgentState.PERCEIVING
                 observation = self._perceive()
                 logger.info(f"Perceived: {observation.active_window}")
 
                 # 2. THINK - Reason about what to do
-                self.state = AgentState.THINKING
+                self.state = AutonomousAgentState.THINKING
                 thought = self._think(observation)
                 logger.info(f"Thought: {thought.plan}")
 
                 # Check if goal is achieved
                 if self._is_goal_achieved(thought):
-                    self.state = AgentState.COMPLETE
+                    self.state = AutonomousAgentState.COMPLETE
                     self.on_step(cycle, "Goal achieved!", "done")
                     break
 
                 # 3. ACT - Execute the decided action
-                self.state = AgentState.ACTING
+                self.state = AutonomousAgentState.ACTING
                 self.on_step(cycle, thought.action, "running")
                 result = self._act(thought)
                 logger.info(f"Action result: {result.success} - {result.message}")
 
                 # 4. OBSERVE - See what happened
-                self.state = AgentState.OBSERVING
+                self.state = AutonomousAgentState.OBSERVING
                 self.history.append({
                     "cycle": cycle,
                     "observation": observation.screenshot_description,
@@ -280,7 +280,7 @@ ALWAYS explain your reasoning before acting.
                     self.on_step(cycle, f"{thought.action} - {result.message}", "failed")
                     # 5. REFLECT on failure (skip if rate limited to save API calls)
                     if "429" not in str(result.message):
-                        self.state = AgentState.REFLECTING
+                        self.state = AutonomousAgentState.REFLECTING
                         reflection = self._reflect(thought, result)
                         self.reflections.append(reflection)
                         logger.info(f"Reflection: {reflection}")
@@ -294,12 +294,12 @@ ALWAYS explain your reasoning before acting.
                 time.sleep(1)  # Brief delay on error
 
         # Final state
-        if self.state == AgentState.COMPLETE:
+        if self.state == AutonomousAgentState.COMPLETE:
             self._record_experience(success=True)
             self._save_memory()
             return f"Successfully completed: {command}"
         else:
-            self.state = AgentState.FAILED
+            self.state = AutonomousAgentState.FAILED
             self._record_experience(success=False)
             self._save_memory()
             return f"Could not complete: {command}"
@@ -479,10 +479,10 @@ If the goal is fully achieved, set "goal_achieved": true.
             pass
         return False
 
-    def _act(self, thought: Thought) -> ActionResult:
+    def _act(self, thought: Thought) -> AutonomousActionResult:
         """Execute the decided action."""
         if not self.tools:
-            return ActionResult(success=False, message="Tools not available")
+            return AutonomousActionResult(success=False, message="Tools not available")
 
         tool_name = thought.tool
         params = thought.params.copy()  # Make a copy to modify
@@ -514,21 +514,21 @@ If the goal is fully achieved, set "goal_achieved": true.
         }
 
         if tool_name not in tool_map:
-            return ActionResult(success=False, message=f"Unknown tool: {tool_name}")
+            return AutonomousActionResult(success=False, message=f"Unknown tool: {tool_name}")
 
         try:
             tool_func = tool_map[tool_name]
             result = tool_func(**params)
 
             if hasattr(result, 'success'):
-                return ActionResult(success=result.success, message=result.message)
+                return AutonomousActionResult(success=result.success, message=result.message)
             else:
-                return ActionResult(success=True, message=str(result))
+                return AutonomousActionResult(success=True, message=str(result))
 
         except Exception as e:
-            return ActionResult(success=False, message=str(e))
+            return AutonomousActionResult(success=False, message=str(e))
 
-    def _reflect(self, thought: Thought, result: ActionResult) -> str:
+    def _reflect(self, thought: Thought, result: AutonomousActionResult) -> str:
         """Reflect on what went wrong and learn from it."""
         prompt = f"""An action failed. Learn from this mistake.
 
@@ -620,7 +620,7 @@ Be specific and actionable. One sentence.
 
     def start_learning_mode(self, task_name: str):
         """Start recording user actions to learn a new procedure."""
-        self.state = AgentState.LEARNING
+        self.state = AutonomousAgentState.LEARNING
         self._learning_task = task_name
         self._learning_steps = []
         self._learning_start_time = time.time()
@@ -629,7 +629,7 @@ Be specific and actionable. One sentence.
 
     def record_learning_step(self, action: str, tool: str, params: Dict):
         """Record a step during learning mode."""
-        if self.state != AgentState.LEARNING:
+        if self.state != AutonomousAgentState.LEARNING:
             return
 
         step = {
@@ -643,11 +643,11 @@ Be specific and actionable. One sentence.
 
     def finish_learning_mode(self, trigger_phrases: List[str] = None):
         """Finish learning and save the procedure."""
-        if self.state != AgentState.LEARNING:
+        if self.state != AutonomousAgentState.LEARNING:
             return "Not in learning mode"
 
         if not self._learning_steps:
-            self.state = AgentState.IDLE
+            self.state = AutonomousAgentState.IDLE
             return "No steps recorded"
 
         # Create procedure
@@ -661,14 +661,14 @@ Be specific and actionable. One sentence.
         self.procedures[self._learning_task] = procedure
         self._save_memory()
 
-        self.state = AgentState.IDLE
+        self.state = AutonomousAgentState.IDLE
         logger.info(f"Learned procedure: {self._learning_task} with {len(self._learning_steps)} steps")
 
         return f"Learned '{self._learning_task}' with {len(self._learning_steps)} steps"
 
     def cancel_learning_mode(self):
         """Cancel learning mode without saving."""
-        self.state = AgentState.IDLE
+        self.state = AutonomousAgentState.IDLE
         self._learning_steps = []
         return "Learning cancelled"
 

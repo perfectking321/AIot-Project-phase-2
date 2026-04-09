@@ -40,7 +40,7 @@ class VisualAction:
     reasoning: str = ""  # Why this action
 
 
-class AgentState(Enum):
+class VisualAgentState(Enum):
     IDLE = "idle"
     PERCEIVING = "perceiving"
     THINKING = "thinking"
@@ -115,7 +115,7 @@ IMPORTANT:
         self.on_status = on_status or (lambda x: None)
         self.on_step = on_step or (lambda n, msg, status: None)
 
-        self.state = AgentState.IDLE
+        self.state = VisualAgentState.IDLE
         self.current_goal = ""
         self.history: List[Dict] = []
         self.max_cycles = 15
@@ -289,14 +289,14 @@ Analyze the screenshot and respond with JSON only. No other text."""
         """
         self.current_goal = command
         self.history = []
-        self.state = AgentState.PERCEIVING
+        self.state = VisualAgentState.PERCEIVING
         self._stop_requested = False
 
         logger.info(f"Processing command visually: {command}")
         self.on_status(f"Understanding: {command}")
 
         cycle = 0
-        while cycle < self.max_cycles and self.state not in [AgentState.COMPLETE, AgentState.FAILED]:
+        while cycle < self.max_cycles and self.state not in [VisualAgentState.COMPLETE, VisualAgentState.FAILED]:
             if self._stop_requested:
                 logger.info("Agent stopped by request")
                 return "Stopped by user"
@@ -306,13 +306,13 @@ Analyze the screenshot and respond with JSON only. No other text."""
 
             try:
                 # 1. PERCEIVE - Capture screenshot
-                self.state = AgentState.PERCEIVING
+                self.state = VisualAgentState.PERCEIVING
                 self.on_step(cycle, "Capturing screen...", "running")
                 screenshot = self._capture_screenshot()
                 logger.info(f"Screenshot captured: {screenshot.size}")
 
                 # 2. THINK - Send to VLM for visual understanding
-                self.state = AgentState.THINKING
+                self.state = VisualAgentState.THINKING
                 self.on_step(cycle, "Analyzing screen...", "thinking")
 
                 # Build context from history
@@ -337,12 +337,12 @@ What do you see? What should I do next to achieve the goal?"""
 
                 # Check if goal achieved
                 if goal_achieved or action.get("type") == "done":
-                    self.state = AgentState.COMPLETE
+                    self.state = VisualAgentState.COMPLETE
                     self.on_step(cycle, "Goal achieved!", "done")
                     break
 
                 # 3. ACT - Execute the suggested action
-                self.state = AgentState.ACTING
+                self.state = VisualAgentState.ACTING
                 action_desc = f"{action.get('type', 'unknown')}: {action.get('target', action.get('text', action.get('key', '')))}"
                 self.on_step(cycle, action_desc, "running")
 
@@ -370,10 +370,10 @@ What do you see? What should I do next to achieve the goal?"""
                 time.sleep(1)
 
         # Final result
-        if self.state == AgentState.COMPLETE:
+        if self.state == VisualAgentState.COMPLETE:
             return f"Successfully completed: {command}"
         else:
-            self.state = AgentState.FAILED
+            self.state = VisualAgentState.FAILED
             return f"Could not complete: {command} (completed {cycle} cycles)"
 
 

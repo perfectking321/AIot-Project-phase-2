@@ -7,9 +7,12 @@ import os
 import time
 import subprocess
 import logging
+import json
 from typing import Optional, List, Any, Tuple
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
+from datetime import datetime
 
 logger = logging.getLogger("voxcode.tools")
 
@@ -44,6 +47,13 @@ try:
     LLM_AVAILABLE = True
 except ImportError:
     LLM_AVAILABLE = False
+
+# Import API registry for richer app launch resolution
+try:
+    from brain.api_registry import APIRegistry
+    API_REGISTRY_AVAILABLE = True
+except ImportError:
+    API_REGISTRY_AVAILABLE = False
 
 
 class ToolStatus(Enum):
@@ -151,6 +161,7 @@ class WindowsTools:
         self._delay = config.agent.action_delay
         self._safe_mode = config.agent.safe_mode
         self._screenshot_dir = "screenshots"
+        self._audit_path = Path("audit_log.jsonl")
         # Use provided vision instance, or fall back to global one
         self._vision = vision_instance if vision_instance else (vision if VISION_AVAILABLE else None)
 
@@ -162,6 +173,9 @@ class WindowsTools:
         # LLM for semantic matching
         self._llm = None
         self._use_semantic_matching = LLM_AVAILABLE
+
+        # API registry for application resolution
+        self._api_registry = APIRegistry() if API_REGISTRY_AVAILABLE else None
 
         if self._use_omniparser:
             logger.info("OmniParser mode enabled for advanced UI detection")
@@ -177,6 +191,48 @@ class WindowsTools:
         if self._llm is None and self._use_semantic_matching:
             self._llm = get_llm_client()
         return self._llm
+
+    def _audit_event(self, event_type: str, payload: dict) -> None:
+        """Append a tool-level audit event to audit_log.jsonl."""
+        try:
+            record = {
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+                "source": "windows_tools",
+                "event_type": event_type,
+                **payload,
+            }
+            self._audit_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self._audit_path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception as e:
+            logger.warning(f"Audit event write failed: {e}")
+
+    def _resolve_app_from_registry(self, query: str) -> Optional[dict]:
+        """
+        Resolve an app from API registry by command text/keyword match.
+        """
+        if not self._api_registry:
+            return None
+
+        try:
+            matches = [
+                item for item in self._api_registry.find_relevant(query)
+                if item.get("kind") == "app"
+            ]
+            if not matches:
+                return None
+
+            normalized = query.lower().strip()
+            for item in matches:
+                name = str(item.get("name", "")).lower()
+                api_id = str(item.get("id", "")).lower()
+                if normalized == name or normalized == api_id:
+                    return item
+
+            return matches[0]
+        except Exception as e:
+            logger.warning(f"Registry app resolution failed: {e}")
+            return None
 
     def _semantic_match(self, user_query: str, elements: list) -> Optional[dict]:
         """
@@ -514,6 +570,7 @@ If no good match exists, respond: {{"match": false, "reason": "why"}}"""
         """Open an application by name or path. Supports Windows Search for unknown apps."""
         app_name = path_or_name.lower().strip()
         logger.info(f"Opening application: {app_name}")
+        self._audit_event("open_application_started", {"query": path_or_name, "normalized_query": app_name})
 
         try:
             # Check known apps first
@@ -522,13 +579,42 @@ If no good match exists, respond: {{"match": false, "reason": "why"}}"""
                 logger.info(f"Using command: {cmd}")
                 subprocess.Popen(cmd, shell=True)
                 time.sleep(2.0)
+                self._audit_event("open_application_succeeded", {
+                    "query": path_or_name,
+                    "method": "app_commands",
+                    "command": cmd,
+                })
                 return ToolResult(ToolStatus.SUCCESS, f"Opened: {path_or_name}")
+
+            # Try rich API registry app entries
+            registry_match = self._resolve_app_from_registry(app_name)
+            if registry_match:
+                exe_name = registry_match.get("exe_name")
+                if exe_name:
+                    launch_cmd = f"start {exe_name}" if ":" in exe_name else f'start "" "{exe_name}"'
+                    logger.info(f"Using registry launch command: {launch_cmd}")
+                    subprocess.Popen(launch_cmd, shell=True)
+                    time.sleep(2.0)
+                    self._audit_event("open_application_succeeded", {
+                        "query": path_or_name,
+                        "method": "api_registry",
+                        "api_id": registry_match.get("id"),
+                        "api_name": registry_match.get("name"),
+                        "exe_name": exe_name,
+                        "command": launch_cmd,
+                    })
+                    return ToolResult(ToolStatus.SUCCESS, f"Opened via registry: {path_or_name}")
 
             # Check if it's a file path
             if os.path.exists(path_or_name):
                 logger.info(f"Opening file path: {path_or_name}")
                 os.startfile(path_or_name)
                 time.sleep(2.0)
+                self._audit_event("open_application_succeeded", {
+                    "query": path_or_name,
+                    "method": "path",
+                    "path": path_or_name,
+                })
                 return ToolResult(ToolStatus.SUCCESS, f"Opened: {path_or_name}")
 
             # Try using Windows Search (Win key + type + enter)
@@ -539,10 +625,18 @@ If no good match exists, respond: {{"match": false, "reason": "why"}}"""
             time.sleep(1.0)
             pyautogui.press('enter')
             time.sleep(2.0)
+            self._audit_event("open_application_succeeded", {
+                "query": path_or_name,
+                "method": "windows_search",
+            })
             return ToolResult(ToolStatus.SUCCESS, f"Searched and opened: {path_or_name}")
 
         except Exception as e:
             logger.error(f"Failed to open {path_or_name}: {e}")
+            self._audit_event("open_application_failed", {
+                "query": path_or_name,
+                "error": str(e),
+            })
             return ToolResult(ToolStatus.FAILURE, f"Failed to open {path_or_name}: {e}")
 
     def focus_window(self, title: str) -> ToolResult:

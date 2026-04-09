@@ -10,6 +10,8 @@ VOXCODE is a local, privacy-first voice assistant that automates Windows tasks u
 - **Text-to-Speech** - Audio feedback using pyttsx3
 - **Local LLM** - Powered by Ollama (Llama, Mistral, etc.)
 - **Windows Automation** - Control apps, type, click, and more
+- **Registry-Backed App Launching** - 50+ web/system/app entries for smarter command routing
+- **Audit Logging** - Planner/verification/launcher events persisted to `audit_log.jsonl`
 - **Terminal UI** - Beautiful TUI built with Textual
 
 ## Installation
@@ -28,7 +30,7 @@ VOXCODE is a local, privacy-first voice assistant that automates Windows tasks u
 
     # Create virtual environment
     python -m venv venv
-    venv\Scriptsctivate  # Windows
+    venv\Scripts/activate  # Windows
 
     # Install dependencies
     pip install -r requirements.txt
@@ -56,27 +58,42 @@ VOXCODE is a local, privacy-first voice assistant that automates Windows tasks u
 ## Architecture
 
     voxcode/
-    ├── config.py           # Global configuration
-    ├── main.py             # Entry point
-    ├── requirements.txt    # Dependencies
-    ├── voice/              # Voice I/O module
-    │   ├── stt.py          # Speech-to-text (Whisper)
-    │   └── tts.py          # Text-to-speech (pyttsx3)
-    ├── brain/              # LLM module
-    │   ├── llm.py          # Ollama client
-    │   └── prompts.py      # System prompts
-    ├── agent/              # Automation module
-    │   ├── tools.py        # Windows automation tools
-    │   ├── planner.py      # Task planning
-    │   └── loop.py         # Agent execution loop
-    └── tui/                # Terminal UI
-        └── app.py          # Textual application
+    ├── config.py                     # Global configuration
+    ├── main.py                       # Entry point
+    ├── voice/
+    │   ├── stt.py                    # Whisper STT
+    │   └── tts.py                    # TTS
+    ├── brain/
+    │   ├── llm.py                    # LLM clients (Groq/Ollama)
+    │   ├── planner.py                # Hierarchical state-based planner
+    │   ├── api_registry.py           # API metadata lookup
+    │   └── prompts.py                # Prompt templates
+    ├── perception/
+    │   ├── omniparser.py             # OmniParser integration wrapper
+    │   └── screen_state.py           # Semantic state representation
+    ├── agent/
+    │   ├── eyes.py                   # Screen element perception
+    │   ├── hands.py                  # QWEN action decision
+    │   ├── verifier.py               # Pixel/state verification
+    │   ├── pipeline.py               # Stateful reactive execution
+    │   └── reactive_loop.py          # Feedback loop utilities
+    ├── tools/
+    │   └── execution.py              # Low-level action executor
+    ├── memory/
+    │   ├── episodic.py               # Episodic memory
+    │   ├── working.py                # Working memory
+    │   ├── persistent.py             # Vault persistence helpers
+    │   └── vault/                    # Persistent profile/history/failures
+    └── tui/
+        └── app.py                    # Textual application
 
 ## Configuration
 
 Environment variables:
 - OLLAMA_HOST - Ollama server URL (default: http://localhost:11434)
 - VOXCODE_MODEL - LLM model name (default: llama3.2)
+- GROQ_API_KEY - Groq API key (required when LLM_PROVIDER=groq)
+- LLM_PROVIDER - LLM provider: ollama or groq
 - WHISPER_MODEL - Whisper model size (tiny/base/small/medium/large)
 - VOXCODE_DEBUG - Enable debug mode
 

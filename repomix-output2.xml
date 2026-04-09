@@ -1,0 +1,3063 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+_prompt.py
+.gitignore
+agent_types.py
+assets/ui-screenshot.png
+assets/voco-logo.png
+constants.py
+context.py
+eval_report_20260408_040657.json
+eval.py
+LICENSE
+llm.py
+memory.py
+memory/vault/APPS.md
+memory/vault/CONTEXT.md
+memory/vault/failures.jsonl
+memory/vault/HISTORY.jsonl
+memory/vault/USER.yaml
+orchestrator.py
+prompts/system.md
+README.md
+sandbox.py
+tools.py
+voco_ui.py
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="_prompt.py">
+"""Prompt builder and parser for VOCO execution-only JSON plans."""
+
+import json
+import os
+import re
+
+import yaml
+
+from constants import (
+    HISTORY_BUDGET,
+    HISTORY_FILE,
+    SYSTEM_PROMPT_BUDGET,
+    USER_PROFILE_BUDGET,
+    USER_PROFILE_FILE,
+)
+from context import AgentContext
+
+
+def build_system_prompt(context: AgentContext) -> str:
+    """
+    Build the system prompt for VOCO execution-only mode.
+    The model must output only a JSON array of action steps.
+    """
+    _ = context
+    user_profile_text = _load_user_profile()
+    history_text = _load_recent_history(max_events=10)
+    tool_spec = _build_tool_spec()
+
+    system_prompt = f"""You are VOCO, a Windows OS automation agent. You DO NOT chat. You DO NOT explain. You DO NOT ask questions.
+
+YOUR ONLY OUTPUT FORMAT IS A JSON ARRAY OF STEPS. NOTHING ELSE.
+
+Every response must be exactly a raw JSON array with no markdown and no extra text:
+[
+  {{"tool": "tool_name_here", "args": {{"arg1": "value1"}}, "reason": "one sentence why"}}
+]
+
+If you cannot complete the task with available tools, output:
+[{{"tool": "report_failure", "args": {{"reason": "explain why in one sentence"}}, "reason": "task not executable"}}]
+
+NEVER OUTPUT ANYTHING EXCEPT THE JSON ARRAY.
+
+AVAILABLE TOOLS:
+{tool_spec}
+
+USER PROFILE:
+{user_profile_text}
+
+RECENT HISTORY (last 10 actions):
+{history_text}
+
+RULES:
+1. Break the task into the minimum number of steps needed.
+2. Each step must use exactly one tool from AVAILABLE TOOLS.
+3. Tool names must match exactly. Do not invent tool names.
+4. All argument values must be strings, numbers, or booleans.
+5. Maximum 12 steps. If more are needed, use report_failure.
+"""
+    return system_prompt[:SYSTEM_PROMPT_BUDGET + USER_PROFILE_BUDGET + HISTORY_BUDGET + 4000]
+
+
+def _load_user_profile() -> str:
+    """Load and format the user profile from YAML vault."""
+    if not os.path.exists(USER_PROFILE_FILE):
+        return "No user profile loaded yet."
+    try:
+        with open(USER_PROFILE_FILE, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+    except OSError as exc:
+        return f"Profile load error: {exc}"
+
+    if not content or content == "# User Profile":
+        return "No user profile data yet."
+
+    try:
+        data = yaml.safe_load(content)
+    except yaml.YAMLError as exc:
+        return f"Profile parse error: {exc}"
+
+    if isinstance(data, dict):
+        lines = [f"- {key}: {value}" for key, value in data.items()]
+        return "\n".join(lines)[:USER_PROFILE_BUDGET]
+    return content[:USER_PROFILE_BUDGET]
+
+
+def _load_recent_history(max_events: int = 10) -> str:
+    """Load recent execution history from JSONL vault."""
+    if not os.path.exists(HISTORY_FILE):
+        return "No history yet."
+    try:
+        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError as exc:
+        return f"History load error: {exc}"
+
+    recent = lines[-max_events:] if len(lines) > max_events else lines
+    events: list[str] = []
+    for line in recent:
+        text = line.strip()
+        if not text:
+            continue
+        try:
+            event = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+        timestamp = str(event.get("timestamp", ""))[:16]
+        task = str(event.get("task", ""))
+        success_marker = "OK" if event.get("success") else "FAIL"
+        events.append(f"{timestamp} {success_marker} {task}")
+
+    history = "\n".join(events) if events else "No history yet."
+    return history[:HISTORY_BUDGET]
+
+
+def _build_tool_spec() -> str:
+    """Build the tool specification string from the tool registry."""
+    try:
+        from tools import TOOL_REGISTRY
+    except Exception as exc:  # pragma: no cover - defensive import path
+        return f"Tool registry error: {exc}"
+
+    spec_lines: list[str] = []
+    for name, info in TOOL_REGISTRY.items():
+        description = info.get("description", "")
+        args = info.get("args", {})
+        args_str = ", ".join([f"{k}: {v}" for k, v in args.items()])
+        spec_lines.append(f"- {name}({args_str}): {description}")
+    return "\n".join(spec_lines)
+
+
+def parse_response(response: str) -> tuple[str, list | None]:
+    """
+    Parse a model response and extract a JSON action plan.
+
+    Returns (status, plan):
+      - ("ok", list)
+      - ("format_failure", None)
+      - ("empty", None)
+    """
+    response = response.strip()
+    if not response:
+        return "empty", None
+
+    try:
+        plan = json.loads(response)
+        if isinstance(plan, list) and len(plan) > 0:
+            return "ok", plan
+    except json.JSONDecodeError:
+        pass
+
+    code_block_match = re.search(r"```(?:json)?\s*(\[.*?\])\s*```", response, re.DOTALL)
+    if code_block_match:
+        try:
+            plan = json.loads(code_block_match.group(1))
+            if isinstance(plan, list) and len(plan) > 0:
+                return "ok", plan
+        except json.JSONDecodeError:
+            pass
+
+    first_bracket = response.find("[")
+    last_bracket = response.rfind("]")
+    if first_bracket != -1 and last_bracket != -1 and last_bracket > first_bracket:
+        try:
+            plan = json.loads(response[first_bracket : last_bracket + 1])
+            if isinstance(plan, list) and len(plan) > 0:
+                return "ok", plan
+        except json.JSONDecodeError:
+            pass
+
+    return "format_failure", None
+
+
+def build_correction_prompt() -> str:
+    """Return the follow-up prompt used after a format failure."""
+    return """Your last response was not valid JSON.
+
+You must output ONLY a JSON array of steps. Example:
+[{"tool": "open_browser", "args": {"url": "https://youtube.com"}, "reason": "open browser to YouTube"}]
+
+Output the corrected JSON array now. Nothing else."""
+</file>
+
+<file path=".gitignore">
+# Private local working notes (do not commit)
+updated-till-now.md
+
+# Local runtime/debug artifacts
+__pycache__/
+*.pyc
+report.*.json
+workspace/screenshot_*.png
+</file>
+
+<file path="agent_types.py">
+"""Typed data structures for VOCO agent session state."""
+
+from dataclasses import dataclass, field
+from typing import Any
+
+
+@dataclass
+class ToolCall:
+    """A parsed tool invocation from the LLM response."""
+    name: str
+    args: dict[str, Any]
+
+
+@dataclass
+class HistoryEntry:
+    """A single turn in the agent conversation."""
+    role: str          # "user" | "assistant"
+    content: str
+
+
+@dataclass
+class AgentContext:
+    """Canonical session state passed through every agent component."""
+    history: list[HistoryEntry] = field(default_factory=list)
+    memory: str = ""                  # loaded from memory/project_state.md
+    workspace: str = "./workspace"
+    last_error: str | None = None
+    step_count: int = 0
+    tools: list[str] = field(default_factory=list)  # names of available tools
+</file>
+
+<file path="constants.py">
+"""Global constants shared across all VOCO modules."""
+
+from pathlib import Path
+
+# ── Paths ────────────────────────────────────────────────────────────────────
+BASE_DIR = Path(__file__).parent.resolve()
+WORKSPACE_PATH = BASE_DIR / "workspace"
+WORKSPACE_DIR = str(WORKSPACE_PATH)
+LOGS_DIR = BASE_DIR / "logs"
+MEMORY_DIR = BASE_DIR / "memory"
+MEMORY_VAULT_DIR = str(MEMORY_DIR / "vault")
+MEMORY_FILE = MEMORY_DIR / "project_state.md"
+SYSTEM_PROMPT_FILE = BASE_DIR / "prompts" / "system.md"
+USER_PROFILE_FILE = str(MEMORY_DIR / "vault" / "USER.yaml")
+HISTORY_FILE = str(MEMORY_DIR / "vault" / "HISTORY.jsonl")
+APPS_FILE = str(MEMORY_DIR / "vault" / "APPS.md")
+CONTEXT_FILE = str(MEMORY_DIR / "vault" / "CONTEXT.md")
+FORMAT_FAILURE_LOG = str(MEMORY_DIR / "vault" / "failures.jsonl")
+
+# ── Agent loop ────────────────────────────────────────────────────────────────
+MAX_STEPS = 8
+MAX_RETRIES = 1
+
+# ── LLM ───────────────────────────────────────────────────────────────────────
+OLLAMA_URL = "http://localhost:11434"
+OLLAMA_MODEL = "qwen3:4b"
+OLLAMA_FAST_MODEL_CANDIDATES = [
+    "qwen2.5:0.5b",
+    "qwen2.5:1.5b",
+    "qwen3:1.7b",
+    "qwen3:4b",
+]
+OLLAMA_HEAVY_MODEL_CANDIDATES = [
+    "qwen3:8b",
+    "qwen3:4b",
+    "qwen3:1.7b",
+    "qwen2.5:1.5b",
+    "qwen2.5:0.5b",
+]
+OLLAMA_NUM_CTX_SIMPLE = 2048
+OLLAMA_NUM_CTX_COMPLEX = 4096
+OLLAMA_NUM_CTX_MIN = 1024
+OLLAMA_NUM_CTX_CONVERSATION = 1024
+OLLAMA_REQUEST_TIMEOUT_SECONDS = 60
+OLLAMA_CONVERSATION_TIMEOUT_SECONDS = 180
+
+# Backward-compatible aliases
+MODEL_NAME = OLLAMA_MODEL
+OLLAMA_BASE_URL = OLLAMA_URL
+
+# ── Prompt/output settings ────────────────────────────────────────────────────
+ACTION_PLAN_MARKER_START = "```json"
+ACTION_PLAN_MARKER_END = "```"
+SYSTEM_PROMPT_BUDGET = 2000
+USER_PROFILE_BUDGET = 1000
+HISTORY_BUDGET = 3000
+TASK_BUDGET = 4000
+ROUTER_CONFIDENCE_THRESHOLD = 0.75
+
+# ── Sandbox ───────────────────────────────────────────────────────────────────
+ALLOWED_EXTENSIONS = {".py", ".txt", ".md", ".json", ".csv", ".yaml", ".yml"}
+</file>
+
+<file path="context.py">
+"""Shared VOCO agent execution context."""
+
+from dataclasses import dataclass, field
+
+from constants import WORKSPACE_PATH
+
+
+@dataclass
+class AgentContext:
+    """Mutable context shared through the VOCO execution loop."""
+
+    task: str = ""
+    steps: list[dict] = field(default_factory=list)
+    tool_results: list[dict] = field(default_factory=list)
+    history: list[dict] = field(default_factory=list)
+    memory: dict = field(default_factory=dict)
+    workspace: str = str(WORKSPACE_PATH)
+    router_decision: str = "unknown"
+    router_confidence: float = 0.0
+
+
+def create_context() -> AgentContext:
+    """Return a fresh context."""
+    return AgentContext()
+
+
+def reset_context(ctx: AgentContext) -> AgentContext:
+    """Reset volatile task state while preserving persistent fields."""
+    ctx.task = ""
+    ctx.steps.clear()
+    ctx.tool_results.clear()
+    ctx.history.clear()
+    ctx.router_decision = "unknown"
+    ctx.router_confidence = 0.0
+    return ctx
+</file>
+
+<file path="eval_report_20260408_040657.json">
+{
+  "timestamp": "2026-04-08T04:06:57.279614",
+  "total": 20,
+  "successes": 1,
+  "success_rate": 5.0,
+  "format_failure_rate": 95.0,
+  "avg_elapsed_seconds": 122.8,
+  "by_category": {
+    "easy": {
+      "total": 5,
+      "successes": 1,
+      "rate": 20.0
+    },
+    "medium": {
+      "total": 5,
+      "successes": 0,
+      "rate": 0.0
+    },
+    "router_stress": {
+      "total": 5,
+      "successes": 0,
+      "rate": 0.0
+    },
+    "messy": {
+      "total": 5,
+      "successes": 0,
+      "rate": 0.0
+    }
+  },
+  "results": [
+    {
+      "prompt": "List all files in the workspace folder",
+      "category": "easy",
+      "expected_path": "llm_task",
+      "success": false,
+      "elapsed_seconds": 126.1,
+      "format_failure": true,
+      "final_output": "[VOCO] FAIL Task complete in 126.1s. Steps: 0/1. Result: Task cannot be completed: retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)",
+      "steps_executed": 1,
+      "error_count": 2
+    },
+    {
+      "prompt": "Take a screenshot",
+      "category": "easy",
+      "expected_path": "os_action",
+      "success": false,
+      "elapsed_seconds": 126.1,
+      "format_failure": true,
+      "final_output": "[VOCO] FAIL Task complete in 126.1s. Steps: 0/1. Result: Task cannot be completed: retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)",
+      "steps_executed": 1,
+      "error_count": 2
+    },
+    {
+      "prompt": "What apps are currently running on my computer?",
+      "category": "easy",
+      "expected_path": "os_action",
+      "success": false,
+      "elapsed_seconds": 126.1,
+      "format_failure": true,
+      "final_output": "[VOCO] FAIL Task complete in 126.1s. Steps: 0/1. Result: Task cannot be completed: retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)",
+      "steps_executed": 1,
+      "error_count": 2
+    },
+    {
+      "prompt": "Open Notepad",
+      "category": "easy",
+      "expected_path": "os_action",
+      "success": false,
+      "elapsed_seconds": 126.1,
+      "format_failure": true,
+      "final_output": "[VOCO] FAIL Task complete in 126.1s. Steps: 0/1. Result: Task cannot be completed: retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)",
+      "steps_executed": 1,
+      "error_count": 2
+    },
+    {
+      "prompt": "Mute the audio",
+      "category": "easy",
+      "expected_path": "os_action",
+      "success": true,
+      "elapsed_seconds": 56.4,
+      "format_failure": false,
+      "final_output": "[VOCO] OK Task complete in 56.4s. Steps: 1/1. Result: Toggled system mute (initial state inferred).",
+      "steps_executed": 1,
+      "error_count": 0
+    },
+    {
+      "prompt": "Open Chrome and go to YouTube",
+      "category": "medium",
+      "expected_path": "os_action",
+      "success": false,
+      "elapsed_seconds": 126.2,
+      "format_failure": true,
+      "final_output": "[VOCO] FAIL Task complete in 126.2s. Steps: 0/1. Result: Task cannot be completed: retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)",
+      "steps_executed": 1,
+      "error_count": 2
+    },
+    {
+      "prompt": "Search for 'MKBHD latest video' on YouTube and click the first result",
+      "category": "medium",
+      "expected_path": "os_action",
+      "success": false,
+      "elapsed_seconds": 126.1,
+      "format_failure": true,
+      "final_output": "[VOCO] FAIL Task complete in 126.1s. Steps: 0/1. Result: Task cannot be completed: retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)",
+      "steps_executed": 1,
+      "error_count": 2
+    },
+    {
+      "prompt": "Open Notepad, type 'Hello from VOCO', and take a screenshot",
+      "category": "medium",
+      "expected_path": "os_action",
+      "success": false,
+      "elapsed_seconds": 126.1,
+      "format_failure": true,
+      "final_output": "[VOCO] FAIL Task complete in 126.1s. Steps: 0/1. Result: Task cannot be completed: retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)",
+      "steps_executed": 1,
+      "error_count": 2
+    },
+    {
+      "prompt": "Search Google for 'Python tutorials 2026' and show me the first 5 results",
+      "category": "medium",
+      "expected_path": "os_action",
+      "success": false,
+      "elapsed_seconds": 126.1,
+      "format_failure": true,
+      "final_output": "[VOCO] FAIL Task complete in 126.1s. Steps: 0/1. Result: Task cannot be completed: retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)",
+      "steps_executed": 1,
+      "error_count": 2
+    },
+    {
+      "prompt": "Create a file called test.txt in the workspace with the content 'VOCO test'",
+      "category": "medium",
+      "expected_path": "llm_task",
+      "success": false,
+      "elapsed_seconds": 126.2,
+      "format_failure": true,
+      "final_output": "[VOCO] FAIL Task complete in 126.2s. Steps: 0/1. Result: Task cannot be completed: retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)",
+      "steps_executed": 1,
+      "error_count": 2
+    },
+    {
+      "prompt": "Open config.py and tell me the model name",
+      "category": "router_stress",
+      "expected_path": "llm_task",
+      "success": false,
+      "elapsed_seconds": 126.1,
+      "format_failure": true,
+      "final_output": "[VOCO] FAIL Task complete in 126.1s. Steps: 0/1. Result: Task cannot be completed: retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)",
+      "steps_executed": 1,
+      "error_count": 2
+    },
+    {
+      "prompt": "Open the browser and also check my workspace files",
+      "category": "router_stress",
+      "expected_path": "os_action",
+      "success": false,
+      "elapsed_seconds": 126.4,
+      "format_failure": true,
+      "final_output": "[VOCO] FAIL Task complete in 126.3s. Steps: 0/1. Result: Task cannot be completed: retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)",
+      "steps_executed": 1,
+      "error_count": 2
+    },
+    {
+      "prompt": "Show me what's in my workspace and also search YouTube for coding tutorials",
+      "category": "router_stress",
+      "expected_path": "os_action",
+      "success": false,
+      "elapsed_seconds": 126.4,
+      "format_failure": true,
+      "final_output": "[VOCO] FAIL Task complete in 126.4s. Steps: 0/1. Result: Task cannot be completed: retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)",
+      "steps_executed": 1,
+      "error_count": 2
+    },
+    {
+      "prompt": "Find all Python files in workspace",
+      "category": "router_stress",
+      "expected_path": "llm_task",
+      "success": false,
+      "elapsed_seconds": 126.4,
+      "format_failure": true,
+      "final_output": "[VOCO] FAIL Task complete in 126.4s. Steps: 0/1. Result: Task cannot be completed: retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)",
+      "steps_executed": 1,
+      "error_count": 2
+    },
+    {
+      "prompt": "Run the main.py file",
+      "category": "router_stress",
+      "expected_path": "llm_task",
+      "success": false,
+      "elapsed_seconds": 126.4,
+      "format_failure": true,
+      "final_output": "[VOCO] FAIL Task complete in 126.4s. Steps: 0/1. Result: Task cannot be completed: retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)",
+      "steps_executed": 1,
+      "error_count": 2
+    },
+    {
+      "prompt": "opn chrome and serch for mkbhd",
+      "category": "messy",
+      "expected_path": "os_action",
+      "success": false,
+      "elapsed_seconds": 126.3,
+      "format_failure": true,
+      "final_output": "[VOCO] FAIL Task complete in 126.3s. Steps: 0/1. Result: Task cannot be completed: retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)",
+      "steps_executed": 1,
+      "error_count": 2
+    },
+    {
+      "prompt": "check the latst vid of mkbhd on youtube",
+      "category": "messy",
+      "expected_path": "os_action",
+      "success": false,
+      "elapsed_seconds": 126.4,
+      "format_failure": true,
+      "final_output": "[VOCO] FAIL Task complete in 126.3s. Steps: 0/1. Result: Task cannot be completed: retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)",
+      "steps_executed": 1,
+      "error_count": 2
+    },
+    {
+      "prompt": "open files and browser and also like maybe search something",
+      "category": "messy",
+      "expected_path": "os_action",
+      "success": false,
+      "elapsed_seconds": 126.2,
+      "format_failure": true,
+      "final_output": "[VOCO] FAIL Task complete in 126.2s. Steps: 0/1. Result: Task cannot be completed: retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)",
+      "steps_executed": 1,
+      "error_count": 2
+    },
+    {
+      "prompt": "set volume",
+      "category": "messy",
+      "expected_path": "os_action",
+      "success": false,
+      "elapsed_seconds": 126.5,
+      "format_failure": true,
+      "final_output": "[VOCO] FAIL Task complete in 126.5s. Steps: 0/1. Result: Task cannot be completed: retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)",
+      "steps_executed": 1,
+      "error_count": 2
+    },
+    {
+      "prompt": "i need to see youtube",
+      "category": "messy",
+      "expected_path": "os_action",
+      "success": false,
+      "elapsed_seconds": 126.7,
+      "format_failure": true,
+      "final_output": "[VOCO] FAIL Task complete in 126.7s. Steps: 0/1. Result: Task cannot be completed: retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)",
+      "steps_executed": 1,
+      "error_count": 2
+    }
+  ]
+}
+</file>
+
+<file path="eval.py">
+"""
+VOCO evaluation script.
+Runs the 20-prompt suite and computes key reliability metrics.
+Run: python eval.py
+"""
+
+from __future__ import annotations
+
+import datetime
+import json
+import time
+
+from context import AgentContext
+from orchestrator import run as orchestrator_run
+
+
+TEST_PROMPTS = [
+    {"prompt": "List all files in the workspace folder", "category": "easy", "expected_path": "llm_task"},
+    {"prompt": "Take a screenshot", "category": "easy", "expected_path": "os_action"},
+    {"prompt": "What apps are currently running on my computer?", "category": "easy", "expected_path": "os_action"},
+    {"prompt": "Open Notepad", "category": "easy", "expected_path": "os_action"},
+    {"prompt": "Mute the audio", "category": "easy", "expected_path": "os_action"},
+    {"prompt": "Open Chrome and go to YouTube", "category": "medium", "expected_path": "os_action"},
+    {
+        "prompt": "Search for 'MKBHD latest video' on YouTube and click the first result",
+        "category": "medium",
+        "expected_path": "os_action",
+    },
+    {
+        "prompt": "Open Notepad, type 'Hello from VOCO', and take a screenshot",
+        "category": "medium",
+        "expected_path": "os_action",
+    },
+    {
+        "prompt": "Search Google for 'Python tutorials 2026' and show me the first 5 results",
+        "category": "medium",
+        "expected_path": "os_action",
+    },
+    {
+        "prompt": "Create a file called test.txt in the workspace with the content 'VOCO test'",
+        "category": "medium",
+        "expected_path": "llm_task",
+    },
+    {"prompt": "Open config.py and tell me the model name", "category": "router_stress", "expected_path": "llm_task"},
+    {
+        "prompt": "Open the browser and also check my workspace files",
+        "category": "router_stress",
+        "expected_path": "os_action",
+    },
+    {
+        "prompt": "Show me what's in my workspace and also search YouTube for coding tutorials",
+        "category": "router_stress",
+        "expected_path": "os_action",
+    },
+    {"prompt": "Find all Python files in workspace", "category": "router_stress", "expected_path": "llm_task"},
+    {"prompt": "Run the main.py file", "category": "router_stress", "expected_path": "llm_task"},
+    {"prompt": "opn chrome and serch for mkbhd", "category": "messy", "expected_path": "os_action"},
+    {"prompt": "check the latst vid of mkbhd on youtube", "category": "messy", "expected_path": "os_action"},
+    {
+        "prompt": "open files and browser and also like maybe search something",
+        "category": "messy",
+        "expected_path": "os_action",
+    },
+    {"prompt": "set volume", "category": "messy", "expected_path": "os_action"},
+    {"prompt": "i need to see youtube", "category": "messy", "expected_path": "os_action"},
+]
+
+
+def evaluate() -> dict:
+    """Run all prompts and return structured evaluation report."""
+    print("=" * 60)
+    print("VOCO EVALUATION SUITE")
+    print(f"Started: {datetime.datetime.now().isoformat()}")
+    print(f"Total prompts: {len(TEST_PROMPTS)}")
+    print("=" * 60)
+
+    results: list[dict] = []
+
+    for index, test in enumerate(TEST_PROMPTS, start=1):
+        prompt = test["prompt"]
+        category = test["category"]
+        expected_path = test["expected_path"]
+
+        print(f"\n[{index}/{len(TEST_PROMPTS)}] Category: {category}")
+        print(f"  Prompt: {prompt}")
+
+        context = AgentContext()
+        messages_emitted: list[dict] = []
+
+        def capture_message(message: str, level: str) -> None:
+            messages_emitted.append({"msg": message, "level": level})
+            if level == "step":
+                print(f"  -> {message}")
+
+        start = time.time()
+        try:
+            final_output = orchestrator_run(task=prompt, context=context, ui_callback=capture_message)
+            elapsed = round(time.time() - start, 1)
+
+            success_messages = [m for m in messages_emitted if m["level"] == "success"]
+            error_messages = [m for m in messages_emitted if m["level"] == "error"]
+            format_failure = any("format issue" in m["msg"].lower() for m in messages_emitted)
+            success = len(success_messages) > 0 and "OK" in final_output
+
+            result = {
+                "prompt": prompt,
+                "category": category,
+                "expected_path": expected_path,
+                "success": success,
+                "elapsed_seconds": elapsed,
+                "format_failure": format_failure,
+                "final_output": final_output[:200],
+                "steps_executed": len([m for m in messages_emitted if m["level"] == "step"]),
+                "error_count": len(error_messages),
+            }
+            print(f"  {'OK' if success else 'FAIL'} {'Success' if success else 'Failed'} in {elapsed}s")
+        except Exception as exc:
+            elapsed = round(time.time() - start, 1)
+            result = {
+                "prompt": prompt,
+                "category": category,
+                "expected_path": expected_path,
+                "success": False,
+                "elapsed_seconds": elapsed,
+                "format_failure": False,
+                "final_output": f"EXCEPTION: {exc}",
+                "steps_executed": 0,
+                "error_count": 1,
+            }
+            print(f"  FAIL EXCEPTION: {exc}")
+
+        results.append(result)
+        time.sleep(1)
+
+    total = len(results)
+    successes = sum(1 for result in results if result["success"])
+    format_failures = sum(1 for result in results if result["format_failure"])
+    avg_elapsed = sum(result["elapsed_seconds"] for result in results) / total
+
+    by_category = {}
+    for category in ["easy", "medium", "router_stress", "messy"]:
+        category_results = [result for result in results if result["category"] == category]
+        success_count = sum(1 for result in category_results if result["success"])
+        by_category[category] = {
+            "total": len(category_results),
+            "successes": success_count,
+            "rate": round((success_count / len(category_results) * 100), 1) if category_results else 0.0,
+        }
+
+    print("\n" + "=" * 60)
+    print("EVALUATION RESULTS")
+    print("=" * 60)
+    print(f"Overall success rate: {successes}/{total} = {round(successes / total * 100, 1)}%")
+    print(f"Format failure rate: {format_failures}/{total} = {round(format_failures / total * 100, 1)}%")
+    print(f"Average task time: {round(avg_elapsed, 1)}s")
+    print("\nBy category:")
+    for category, stats in by_category.items():
+        print(f"  {category}: {stats['successes']}/{stats['total']} = {stats['rate']}%")
+
+    print("\nDECISION GUIDE:")
+    overall_rate = successes / total * 100
+    format_rate = format_failures / total * 100
+    if overall_rate < 50:
+        print("  WARNING: Overall success < 50% - core loop is unstable.")
+    elif overall_rate < 80:
+        print("  WARNING: Overall success 50-80% - prioritize weakest categories.")
+    else:
+        print("  OK: Overall success >= 80% - core loop is stable.")
+
+    if format_rate > 15:
+        print("  WARNING: Format failures > 15% - consider QLoRA fine-tuning.")
+    else:
+        print("  OK: Format failures <= 15% - prompt + parser is sufficient.")
+
+    report = {
+        "timestamp": datetime.datetime.now().isoformat(),
+        "total": total,
+        "successes": successes,
+        "success_rate": round(successes / total * 100, 1),
+        "format_failure_rate": round(format_failures / total * 100, 1),
+        "avg_elapsed_seconds": round(avg_elapsed, 1),
+        "by_category": by_category,
+        "results": results,
+    }
+
+    report_file = f"eval_report_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    with open(report_file, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2, ensure_ascii=False)
+
+    print(f"\nFull report saved to: {report_file}")
+    return report
+
+
+if __name__ == "__main__":
+    evaluate()
+</file>
+
+<file path="LICENSE">
+MIT License
+
+Copyright (c) 2026 Aryan Shukla
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+</file>
+
+<file path="llm.py">
+"""Ollama client for VOCO JSON action-plan generation."""
+
+import json
+
+import requests
+
+from constants import (
+    OLLAMA_FAST_MODEL_CANDIDATES,
+    OLLAMA_HEAVY_MODEL_CANDIDATES,
+    OLLAMA_MODEL,
+    OLLAMA_CONVERSATION_TIMEOUT_SECONDS,
+    OLLAMA_NUM_CTX_CONVERSATION,
+    OLLAMA_NUM_CTX_COMPLEX,
+    OLLAMA_NUM_CTX_MIN,
+    OLLAMA_NUM_CTX_SIMPLE,
+    OLLAMA_REQUEST_TIMEOUT_SECONDS,
+    OLLAMA_URL,
+)
+
+
+OLLAMA_CHAT_URL = f"{OLLAMA_URL}/api/chat"
+_last_model_used = OLLAMA_MODEL
+_last_num_ctx_used = OLLAMA_NUM_CTX_SIMPLE
+
+
+def _failure_plan(reason: str, failure_reason: str = "connection error") -> str:
+    """Return a one-step report_failure plan JSON."""
+    plan = [{"tool": "report_failure", "args": {"reason": reason}, "reason": failure_reason}]
+    return json.dumps(plan, ensure_ascii=False)
+
+
+def _fetch_available_models() -> list[str]:
+    """Return available local Ollama model names."""
+    try:
+        response = requests.get(f"{OLLAMA_URL}/api/tags", timeout=3)
+        response.raise_for_status()
+        models = [item.get("name", "") for item in response.json().get("models", [])]
+        return [name for name in models if name]
+    except Exception:
+        return []
+
+
+def _resolve_candidate(candidate: str, available_models: list[str]) -> str | None:
+    """Resolve a preferred candidate to an installed model name."""
+    for available in available_models:
+        if available == candidate or available.startswith(f"{candidate}:"):
+            return available
+    return None
+
+
+def _is_complex_task(user_message: str) -> bool:
+    """Heuristic complexity estimate for dual-model routing."""
+    text = user_message.lower()
+    indicators = [
+        " and ",
+        " then ",
+        " after ",
+        " also ",
+        " compare ",
+        " analyze ",
+        " explain ",
+        " summarize ",
+        " first ",
+        " second ",
+        " search ",
+        " find ",
+    ]
+    return len(text.split()) > 12 or any(token in text for token in indicators)
+
+
+def _initial_num_ctx(user_message: str) -> int:
+    """Choose initial context window by task complexity."""
+    return OLLAMA_NUM_CTX_COMPLEX if _is_complex_task(user_message) else OLLAMA_NUM_CTX_SIMPLE
+
+
+def _ctx_fallback_chain(initial_ctx: int) -> list[int]:
+    """Return a descending list of context sizes to fit lower-memory devices."""
+    chain = [initial_ctx]
+    for ctx in [4096, 3072, 2048, 1536, 1024]:
+        if ctx < initial_ctx and ctx >= OLLAMA_NUM_CTX_MIN and ctx not in chain:
+            chain.append(ctx)
+    if OLLAMA_NUM_CTX_MIN not in chain:
+        chain.append(OLLAMA_NUM_CTX_MIN)
+    return chain
+
+
+def _candidate_chain(complex_task: bool, prefer_fast: bool = False) -> list[str]:
+    if prefer_fast:
+        return OLLAMA_FAST_MODEL_CANDIDATES + OLLAMA_HEAVY_MODEL_CANDIDATES
+    if complex_task:
+        return OLLAMA_HEAVY_MODEL_CANDIDATES + OLLAMA_FAST_MODEL_CANDIDATES
+    return OLLAMA_FAST_MODEL_CANDIDATES + OLLAMA_HEAVY_MODEL_CANDIDATES
+
+
+def _select_model(user_message: str, available_models: list[str], prefer_fast: bool = False) -> str:
+    """Pick the best installed model using fast/heavy preference."""
+    chain = _candidate_chain(_is_complex_task(user_message), prefer_fast=prefer_fast)
+    seen: set[str] = set()
+    for candidate in chain:
+        resolved = _resolve_candidate(candidate, available_models)
+        if resolved and resolved not in seen:
+            seen.add(resolved)
+            return resolved
+    return OLLAMA_MODEL
+
+
+def _fallback_models(
+    current_model: str,
+    user_message: str,
+    available_models: list[str],
+    prefer_fast: bool = False,
+) -> list[str]:
+    """Return smaller/alternative installed models after a failed attempt."""
+    chain = _candidate_chain(_is_complex_task(user_message), prefer_fast=prefer_fast)
+    resolved_models: list[str] = []
+    for candidate in chain:
+        resolved = _resolve_candidate(candidate, available_models)
+        if resolved and resolved not in resolved_models:
+            resolved_models.append(resolved)
+    return [model for model in resolved_models if model != current_model]
+
+
+def _extract_http_error_detail(response: requests.Response | None) -> str:
+    """Extract a short human-readable error detail from an HTTP response."""
+    if response is None:
+        return "No response body"
+    try:
+        payload = response.json()
+        if isinstance(payload, dict):
+            if payload.get("error"):
+                return str(payload["error"])
+            if payload.get("message"):
+                return str(payload["message"])
+            return json.dumps(payload, ensure_ascii=False)[:240]
+        return str(payload)[:240]
+    except ValueError:
+        text = response.text.strip()
+        return text[:240] if text else "No error detail"
+
+
+def _post_chat(
+    messages: list[dict],
+    model_name: str,
+    temperature: float,
+    num_ctx: int,
+    timeout_seconds: int,
+    num_predict: int | None = None,
+) -> requests.Response:
+    payload = {
+        "model": model_name,
+        "messages": messages,
+        "stream": False,
+        "options": {
+            "temperature": temperature,
+            "top_p": 0.9,
+            "repeat_penalty": 1.1,
+            "num_ctx": num_ctx,
+        },
+    }
+    if num_predict is not None:
+        payload["options"]["num_predict"] = num_predict
+    return requests.post(OLLAMA_CHAT_URL, json=payload, timeout=timeout_seconds)
+
+
+def _generate_result_internal(
+    messages: list[dict],
+    user_message: str,
+    temperature: float,
+    *,
+    prefer_fast: bool = False,
+    preferred_ctx: int | None = None,
+    timeout_seconds: int = OLLAMA_REQUEST_TIMEOUT_SECONDS,
+    num_predict: int | None = None,
+) -> tuple[bool, str]:
+    """Shared model request path with automatic model/context fallback."""
+    global _last_model_used, _last_num_ctx_used
+    available_models = _fetch_available_models()
+    selected_model = _select_model(user_message, available_models, prefer_fast=prefer_fast)
+    _last_model_used = selected_model
+    initial_ctx = preferred_ctx if preferred_ctx is not None else _initial_num_ctx(user_message)
+    primary_ctx_chain = _ctx_fallback_chain(initial_ctx)
+    last_http_detail = ""
+
+    for ctx in primary_ctx_chain:
+        try:
+            _last_num_ctx_used = ctx
+            response = _post_chat(
+                messages=messages,
+                model_name=selected_model,
+                temperature=temperature,
+                num_ctx=ctx,
+                timeout_seconds=timeout_seconds,
+                num_predict=num_predict,
+            )
+            response.raise_for_status()
+            return True, response.json()["message"]["content"]
+        except requests.exceptions.ConnectionError:
+            return False, "LLM connection failed (Ollama unreachable)."
+        except requests.exceptions.Timeout:
+            return False, f"LLM request timed out after {timeout_seconds}s."
+        except requests.exceptions.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else "unknown"
+            detail = _extract_http_error_detail(exc.response)
+            last_http_detail = f"LLM server returned HTTP {status}: {detail}"
+            if status == 500 and "requires more system memory" in detail.lower():
+                # keep trying with smaller context for same model
+                continue
+            return False, last_http_detail
+        except Exception as exc:
+            return False, f"LLM unexpected error: {exc}"
+
+    # If primary model still fails under lowest context, try alternate installed models.
+    for fallback_model in _fallback_models(
+        selected_model,
+        user_message,
+        available_models,
+        prefer_fast=prefer_fast,
+    ):
+        for ctx in primary_ctx_chain:
+            try:
+                _last_num_ctx_used = ctx
+                response = _post_chat(
+                    messages=messages,
+                    model_name=fallback_model,
+                    temperature=temperature,
+                    num_ctx=ctx,
+                    timeout_seconds=timeout_seconds,
+                    num_predict=num_predict,
+                )
+                response.raise_for_status()
+                _last_model_used = fallback_model
+                return True, response.json()["message"]["content"]
+            except requests.exceptions.Timeout:
+                last_http_detail = f"LLM request timed out after {timeout_seconds}s."
+                break
+            except requests.exceptions.HTTPError as exc:
+                status = exc.response.status_code if exc.response is not None else "unknown"
+                detail = _extract_http_error_detail(exc.response)
+                last_http_detail = f"LLM server returned HTTP {status}: {detail}"
+                if status == 500 and "requires more system memory" in detail.lower():
+                    continue
+                break
+            except Exception:
+                break
+
+    if last_http_detail:
+        return False, last_http_detail
+    return False, "LLM request failed after adaptive model/context fallback."
+
+
+def _generate_internal(messages: list[dict], user_message: str, temperature: float) -> str:
+    """Generate a JSON plan response, converting transport errors into report_failure plans."""
+    success, content = _generate_result_internal(
+        messages=messages,
+        user_message=user_message,
+        temperature=temperature,
+    )
+    if success:
+        return content
+    return _failure_plan(content)
+
+
+def generate(system_prompt: str, user_message: str, temperature: float = 0.1) -> str:
+    """Generate an action plan for a task."""
+    payload = {
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message},
+        ],
+    }
+    return _generate_internal(
+        messages=payload["messages"],
+        user_message=user_message,
+        temperature=temperature,
+    )
+
+
+def generate_conversation(user_message: str, temperature: float = 0.2) -> tuple[bool, str]:
+    """Generate a model-based conversational response (no JSON planning)."""
+    system_prompt = (
+        "You are VOCO, a local desktop assistant. "
+        "Reply naturally in plain text and keep responses concise."
+    )
+    success, content = _generate_result_internal(
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message},
+        ],
+        user_message=user_message,
+        temperature=temperature,
+        prefer_fast=True,
+        preferred_ctx=OLLAMA_NUM_CTX_CONVERSATION,
+        timeout_seconds=OLLAMA_CONVERSATION_TIMEOUT_SECONDS,
+    )
+    if success and not content.strip():
+        return False, "LLM returned an empty response."
+    return success, content.strip()
+
+
+def generate_with_history(system_prompt: str, messages: list, temperature: float = 0.05) -> str:
+    """
+    Generate with explicit conversation history.
+    Used for correction retries after formatting failures.
+    """
+    full_messages = [{"role": "system", "content": system_prompt}] + messages
+    result = _generate_internal(
+        messages=full_messages,
+        user_message=messages[-1]["content"] if messages else "",
+        temperature=temperature,
+    )
+    if "retry failed" not in result and "\"reason\": \"connection error\"" in result:
+        return result.replace("\"reason\": \"connection error\"", "\"reason\": \"retry error\"")
+    return result
+
+
+def check_ollama_running() -> bool:
+    """Return True if Ollama is reachable and at least one model is installed."""
+    try:
+        response = requests.get(f"{OLLAMA_URL}/api/tags", timeout=3)
+        response.raise_for_status()
+        models = [model.get("name", "") for model in response.json().get("models", [])]
+        return any(models)
+    except Exception:
+        return False
+
+
+def get_last_model_used() -> str:
+    """Return the model name used by the latest generate/generate_with_history call."""
+    return _last_model_used
+
+
+def get_last_num_ctx_used() -> int:
+    """Return the num_ctx value used by the latest generate/generate_with_history call."""
+    return _last_num_ctx_used
+</file>
+
+<file path="memory.py">
+"""Flat-file memory helpers for VOCO."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from constants import HISTORY_FILE, MEMORY_FILE
+
+
+def load_memory() -> dict:
+    """Load memory snapshot from project_state.md into a dict payload."""
+    path = Path(MEMORY_FILE)
+    if not path.exists():
+        return {}
+    return {"project_state": path.read_text(encoding="utf-8")}
+
+
+def save_memory(data: dict | str) -> None:
+    """Persist memory payload to project_state.md."""
+    path = Path(MEMORY_FILE)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if isinstance(data, dict):
+        content = data.get("project_state", "")
+        path.write_text(str(content), encoding="utf-8")
+        return
+    path.write_text(str(data), encoding="utf-8")
+
+
+def append_memory(entry: str) -> None:
+    """Append free-text content to project_state.md."""
+    current = load_memory().get("project_state", "")
+    updated = (current.rstrip() + "\n\n" + entry.strip()).strip()
+    save_memory({"project_state": updated})
+
+
+def append_event(event: dict) -> None:
+    """Append a JSON event record to HISTORY.jsonl."""
+    history_path = Path(HISTORY_FILE)
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(history_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(event, ensure_ascii=False) + "\n")
+</file>
+
+<file path="memory/vault/APPS.md">
+# App Registry
+</file>
+
+<file path="memory/vault/CONTEXT.md">
+# Current Session
+</file>
+
+<file path="memory/vault/failures.jsonl">
+{"timestamp": "2026-04-08T03:18:44.411739", "task": "List files in workspace", "raw_response": "[]", "corrected_response": "[{\"tool\": \"report_failure\", \"args\": {\"reason\": \"retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)\"}, \"reason\": \"retry error\"}]", "correction_worked": true, "model": "qwen3:4b"}
+{"timestamp": "2026-04-08T03:21:33.186097", "task": "List all files in the workspace folder", "raw_response": "[]", "corrected_response": "[{\"tool\": \"report_failure\", \"args\": {\"reason\": \"retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)\"}, \"reason\": \"retry error\"}]", "correction_worked": true, "model": "qwen3:4b"}
+{"timestamp": "2026-04-08T03:27:47.965573", "task": "List all files in the workspace folder", "raw_response": "[]", "corrected_response": "[{\"tool\": \"report_failure\", \"args\": {\"reason\": \"retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)\"}, \"reason\": \"retry error\"}]", "correction_worked": true, "model": "qwen3:4b"}
+{"timestamp": "2026-04-08T03:29:55.070419", "task": "Take a screenshot", "raw_response": "[]", "corrected_response": "[{\"tool\": \"report_failure\", \"args\": {\"reason\": \"retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)\"}, \"reason\": \"retry error\"}]", "correction_worked": true, "model": "qwen3:4b"}
+{"timestamp": "2026-04-08T03:32:02.207367", "task": "What apps are currently running on my computer?", "raw_response": "[]", "corrected_response": "[{\"tool\": \"report_failure\", \"args\": {\"reason\": \"retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)\"}, \"reason\": \"retry error\"}]", "correction_worked": true, "model": "qwen3:4b"}
+{"timestamp": "2026-04-08T03:34:09.311529", "task": "Open Notepad", "raw_response": "[]", "corrected_response": "[{\"tool\": \"report_failure\", \"args\": {\"reason\": \"retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)\"}, \"reason\": \"retry error\"}]", "correction_worked": true, "model": "qwen3:4b"}
+{"timestamp": "2026-04-08T03:37:13.835774", "task": "Open Chrome and go to YouTube", "raw_response": "[]", "corrected_response": "[{\"tool\": \"report_failure\", \"args\": {\"reason\": \"retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)\"}, \"reason\": \"retry error\"}]", "correction_worked": true, "model": "qwen3:4b"}
+{"timestamp": "2026-04-08T03:39:20.983597", "task": "Search for 'MKBHD latest video' on YouTube and click the first result", "raw_response": "[]", "corrected_response": "[{\"tool\": \"report_failure\", \"args\": {\"reason\": \"retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)\"}, \"reason\": \"retry error\"}]", "correction_worked": true, "model": "qwen3:4b"}
+{"timestamp": "2026-04-08T03:41:28.129872", "task": "Open Notepad, type 'Hello from VOCO', and take a screenshot", "raw_response": "[]", "corrected_response": "[{\"tool\": \"report_failure\", \"args\": {\"reason\": \"retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)\"}, \"reason\": \"retry error\"}]", "correction_worked": true, "model": "qwen3:4b"}
+{"timestamp": "2026-04-08T03:43:35.222231", "task": "Search Google for 'Python tutorials 2026' and show me the first 5 results", "raw_response": "[]", "corrected_response": "[{\"tool\": \"report_failure\", \"args\": {\"reason\": \"retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)\"}, \"reason\": \"retry error\"}]", "correction_worked": true, "model": "qwen3:4b"}
+{"timestamp": "2026-04-08T03:45:42.390225", "task": "Create a file called test.txt in the workspace with the content 'VOCO test'", "raw_response": "[]", "corrected_response": "[{\"tool\": \"report_failure\", \"args\": {\"reason\": \"retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)\"}, \"reason\": \"retry error\"}]", "correction_worked": true, "model": "qwen3:4b"}
+{"timestamp": "2026-04-08T03:47:49.500485", "task": "Open config.py and tell me the model name", "raw_response": "[]", "corrected_response": "[{\"tool\": \"report_failure\", \"args\": {\"reason\": \"retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)\"}, \"reason\": \"retry error\"}]", "correction_worked": true, "model": "qwen3:4b"}
+{"timestamp": "2026-04-08T03:49:56.817613", "task": "Open the browser and also check my workspace files", "raw_response": "[]", "corrected_response": "[{\"tool\": \"report_failure\", \"args\": {\"reason\": \"retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)\"}, \"reason\": \"retry error\"}]", "correction_worked": true, "model": "qwen3:4b"}
+{"timestamp": "2026-04-08T03:52:04.197717", "task": "Show me what's in my workspace and also search YouTube for coding tutorials", "raw_response": "[]", "corrected_response": "[{\"tool\": \"report_failure\", \"args\": {\"reason\": \"retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)\"}, \"reason\": \"retry error\"}]", "correction_worked": true, "model": "qwen3:4b"}
+{"timestamp": "2026-04-08T03:54:11.618359", "task": "Find all Python files in workspace", "raw_response": "[]", "corrected_response": "[{\"tool\": \"report_failure\", \"args\": {\"reason\": \"retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)\"}, \"reason\": \"retry error\"}]", "correction_worked": true, "model": "qwen3:4b"}
+{"timestamp": "2026-04-08T03:56:19.064623", "task": "Run the main.py file", "raw_response": "[]", "corrected_response": "[{\"tool\": \"report_failure\", \"args\": {\"reason\": \"retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)\"}, \"reason\": \"retry error\"}]", "correction_worked": true, "model": "qwen3:4b"}
+{"timestamp": "2026-04-08T03:58:26.415163", "task": "opn chrome and serch for mkbhd", "raw_response": "[]", "corrected_response": "[{\"tool\": \"report_failure\", \"args\": {\"reason\": \"retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)\"}, \"reason\": \"retry error\"}]", "correction_worked": true, "model": "qwen3:4b"}
+{"timestamp": "2026-04-08T04:00:33.765540", "task": "check the latst vid of mkbhd on youtube", "raw_response": "[]", "corrected_response": "[{\"tool\": \"report_failure\", \"args\": {\"reason\": \"retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)\"}, \"reason\": \"retry error\"}]", "correction_worked": true, "model": "qwen3:4b"}
+{"timestamp": "2026-04-08T04:02:41.041770", "task": "open files and browser and also like maybe search something", "raw_response": "[]", "corrected_response": "[{\"tool\": \"report_failure\", \"args\": {\"reason\": \"retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)\"}, \"reason\": \"retry error\"}]", "correction_worked": true, "model": "qwen3:4b"}
+{"timestamp": "2026-04-08T04:04:48.532354", "task": "set volume", "raw_response": "[]", "corrected_response": "[{\"tool\": \"report_failure\", \"args\": {\"reason\": \"retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)\"}, \"reason\": \"retry error\"}]", "correction_worked": true, "model": "qwen3:4b"}
+{"timestamp": "2026-04-08T04:06:56.150523", "task": "i need to see youtube", "raw_response": "[]", "corrected_response": "[{\"tool\": \"report_failure\", \"args\": {\"reason\": \"retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)\"}, \"reason\": \"retry error\"}]", "correction_worked": true, "model": "qwen3:4b"}
+</file>
+
+<file path="memory/vault/HISTORY.jsonl">
+# Execution History
+{"timestamp": "2026-04-08T03:18:44.420182", "task": "List files in workspace", "success": false, "steps_completed": 0, "format_failures": 1, "retries": 1, "final_output": "Task cannot be completed: retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)", "error": "execution_error", "elapsed_seconds": 126.2, "router_decision": "unknown", "router_confidence": 0.0, "model": "qwen3:4b"}
+{"timestamp": "2026-04-08T03:21:33.189780", "task": "List all files in the workspace folder", "success": false, "steps_completed": 0, "format_failures": 1, "retries": 1, "final_output": "Task cannot be completed: retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)", "error": "execution_error", "elapsed_seconds": 126.2, "router_decision": "unknown", "router_confidence": 0.0, "model": "qwen3:4b"}
+{"timestamp": "2026-04-08T03:27:47.967223", "task": "List all files in the workspace folder", "success": false, "steps_completed": 0, "format_failures": 1, "retries": 1, "final_output": "Task cannot be completed: retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)", "error": "execution_error", "elapsed_seconds": 126.1, "router_decision": "unknown", "router_confidence": 0.0, "model": "qwen3:4b"}
+{"timestamp": "2026-04-08T03:29:55.071608", "task": "Take a screenshot", "success": false, "steps_completed": 0, "format_failures": 1, "retries": 1, "final_output": "Task cannot be completed: retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)", "error": "execution_error", "elapsed_seconds": 126.1, "router_decision": "unknown", "router_confidence": 0.0, "model": "qwen3:4b"}
+{"timestamp": "2026-04-08T03:32:02.208873", "task": "What apps are currently running on my computer?", "success": false, "steps_completed": 0, "format_failures": 1, "retries": 1, "final_output": "Task cannot be completed: retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)", "error": "execution_error", "elapsed_seconds": 126.1, "router_decision": "unknown", "router_confidence": 0.0, "model": "qwen3:4b"}
+{"timestamp": "2026-04-08T03:34:09.313530", "task": "Open Notepad", "success": false, "steps_completed": 0, "format_failures": 1, "retries": 1, "final_output": "Task cannot be completed: retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)", "error": "execution_error", "elapsed_seconds": 126.1, "router_decision": "unknown", "router_confidence": 0.0, "model": "qwen3:4b"}
+{"timestamp": "2026-04-08T03:35:06.677362", "task": "Mute the audio", "success": true, "steps_completed": 1, "format_failures": 0, "retries": 0, "final_output": "Toggled system mute (initial state inferred).", "error": null, "elapsed_seconds": 56.4, "router_decision": "unknown", "router_confidence": 0.0, "model": "qwen3:4b"}
+{"timestamp": "2026-04-08T03:37:13.838687", "task": "Open Chrome and go to YouTube", "success": false, "steps_completed": 0, "format_failures": 1, "retries": 1, "final_output": "Task cannot be completed: retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)", "error": "execution_error", "elapsed_seconds": 126.2, "router_decision": "unknown", "router_confidence": 0.0, "model": "qwen3:4b"}
+{"timestamp": "2026-04-08T03:39:20.985927", "task": "Search for 'MKBHD latest video' on YouTube and click the first result", "success": false, "steps_completed": 0, "format_failures": 1, "retries": 1, "final_output": "Task cannot be completed: retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)", "error": "execution_error", "elapsed_seconds": 126.1, "router_decision": "unknown", "router_confidence": 0.0, "model": "qwen3:4b"}
+{"timestamp": "2026-04-08T03:41:28.131975", "task": "Open Notepad, type 'Hello from VOCO', and take a screenshot", "success": false, "steps_completed": 0, "format_failures": 1, "retries": 1, "final_output": "Task cannot be completed: retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)", "error": "execution_error", "elapsed_seconds": 126.1, "router_decision": "unknown", "router_confidence": 0.0, "model": "qwen3:4b"}
+{"timestamp": "2026-04-08T03:43:35.223862", "task": "Search Google for 'Python tutorials 2026' and show me the first 5 results", "success": false, "steps_completed": 0, "format_failures": 1, "retries": 1, "final_output": "Task cannot be completed: retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)", "error": "execution_error", "elapsed_seconds": 126.1, "router_decision": "unknown", "router_confidence": 0.0, "model": "qwen3:4b"}
+{"timestamp": "2026-04-08T03:45:42.393699", "task": "Create a file called test.txt in the workspace with the content 'VOCO test'", "success": false, "steps_completed": 0, "format_failures": 1, "retries": 1, "final_output": "Task cannot be completed: retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)", "error": "execution_error", "elapsed_seconds": 126.2, "router_decision": "unknown", "router_confidence": 0.0, "model": "qwen3:4b"}
+{"timestamp": "2026-04-08T03:47:49.506974", "task": "Open config.py and tell me the model name", "success": false, "steps_completed": 0, "format_failures": 1, "retries": 1, "final_output": "Task cannot be completed: retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)", "error": "execution_error", "elapsed_seconds": 126.1, "router_decision": "unknown", "router_confidence": 0.0, "model": "qwen3:4b"}
+{"timestamp": "2026-04-08T03:49:56.856129", "task": "Open the browser and also check my workspace files", "success": false, "steps_completed": 0, "format_failures": 1, "retries": 1, "final_output": "Task cannot be completed: retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)", "error": "execution_error", "elapsed_seconds": 126.3, "router_decision": "unknown", "router_confidence": 0.0, "model": "qwen3:4b"}
+{"timestamp": "2026-04-08T03:52:04.234530", "task": "Show me what's in my workspace and also search YouTube for coding tutorials", "success": false, "steps_completed": 0, "format_failures": 1, "retries": 1, "final_output": "Task cannot be completed: retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)", "error": "execution_error", "elapsed_seconds": 126.4, "router_decision": "unknown", "router_confidence": 0.0, "model": "qwen3:4b"}
+{"timestamp": "2026-04-08T03:54:11.657279", "task": "Find all Python files in workspace", "success": false, "steps_completed": 0, "format_failures": 1, "retries": 1, "final_output": "Task cannot be completed: retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)", "error": "execution_error", "elapsed_seconds": 126.4, "router_decision": "unknown", "router_confidence": 0.0, "model": "qwen3:4b"}
+{"timestamp": "2026-04-08T03:56:19.107051", "task": "Run the main.py file", "success": false, "steps_completed": 0, "format_failures": 1, "retries": 1, "final_output": "Task cannot be completed: retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)", "error": "execution_error", "elapsed_seconds": 126.4, "router_decision": "unknown", "router_confidence": 0.0, "model": "qwen3:4b"}
+{"timestamp": "2026-04-08T03:58:26.460153", "task": "opn chrome and serch for mkbhd", "success": false, "steps_completed": 0, "format_failures": 1, "retries": 1, "final_output": "Task cannot be completed: retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)", "error": "execution_error", "elapsed_seconds": 126.3, "router_decision": "unknown", "router_confidence": 0.0, "model": "qwen3:4b"}
+{"timestamp": "2026-04-08T04:00:33.817012", "task": "check the latst vid of mkbhd on youtube", "success": false, "steps_completed": 0, "format_failures": 1, "retries": 1, "final_output": "Task cannot be completed: retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)", "error": "execution_error", "elapsed_seconds": 126.3, "router_decision": "unknown", "router_confidence": 0.0, "model": "qwen3:4b"}
+{"timestamp": "2026-04-08T04:02:41.063879", "task": "open files and browser and also like maybe search something", "success": false, "steps_completed": 0, "format_failures": 1, "retries": 1, "final_output": "Task cannot be completed: retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)", "error": "execution_error", "elapsed_seconds": 126.2, "router_decision": "unknown", "router_confidence": 0.0, "model": "qwen3:4b"}
+{"timestamp": "2026-04-08T04:04:48.580155", "task": "set volume", "success": false, "steps_completed": 0, "format_failures": 1, "retries": 1, "final_output": "Task cannot be completed: retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)", "error": "execution_error", "elapsed_seconds": 126.5, "router_decision": "unknown", "router_confidence": 0.0, "model": "qwen3:4b"}
+{"timestamp": "2026-04-08T04:06:56.246682", "task": "i need to see youtube", "success": false, "steps_completed": 0, "format_failures": 1, "retries": 1, "final_output": "Task cannot be completed: retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)", "error": "execution_error", "elapsed_seconds": 126.7, "router_decision": "unknown", "router_confidence": 0.0, "model": "qwen3:4b"}
+</file>
+
+<file path="memory/vault/USER.yaml">
+# VOCO User Profile
+# Automatically loaded at every session start
+# Edit this file directly or use: update_user_profile tool
+
+name: Aryan
+university: SRMIST Kattankulathur Chennai
+year: 2nd year B.Tech CSE
+preferred_browser: chrome
+preferred_code_editor: vscode
+operating_system: Windows 11
+workspace_directory: workspace/
+default_download_location: "O:/Downloads"
+lab_machine: "HP Z2 Tower - accessible via Tailscale SSH"
+ollama_model_laptop: qwen3:4b
+ollama_model_lab: qwen3:8b
+primary_language: Python
+common_tasks:
+  - "Check YouTube channels (MKBHD, etc.)"
+  - "Open VS Code with specific projects"
+  - "Web research"
+  - "File management"
+notes: "VOCO is Aryan's local Windows automation agent. No chatting - execution only."
+</file>
+
+<file path="orchestrator.py">
+"""
+VOCO Orchestrator - execution-only JSON-plan loop.
+Flow: task -> prompt -> LLM plan -> parse -> dispatch tools -> summarize.
+"""
+
+from __future__ import annotations
+
+import datetime
+import json
+import os
+import re
+import time
+
+from constants import (
+    CONTEXT_FILE,
+    FORMAT_FAILURE_LOG,
+    MAX_RETRIES,
+    MAX_STEPS,
+    OLLAMA_MODEL,
+)
+from context import AgentContext
+from llm import (
+    check_ollama_running,
+    generate_conversation,
+    generate,
+    generate_with_history,
+    get_last_model_used,
+    get_last_num_ctx_used,
+)
+from memory import append_event
+from tools import TOOL_REGISTRY, dispatch_tool
+from _prompt import build_correction_prompt, build_system_prompt, parse_response
+
+
+def run(task: str, context: AgentContext, ui_callback=None) -> str:
+    """
+    Execute a user task through VOCO's plan-and-dispatch loop.
+
+    ui_callback signature: callback(message: str, level: str)
+    levels: info | step | success | error
+    """
+    start_time = time.time()
+    context.task = task
+    context.steps = []
+    context.tool_results = []
+    model_used = "local-fastpath"
+
+    def emit(message: str, level: str = "info") -> None:
+        if ui_callback:
+            ui_callback(message, level)
+
+    format_failures = 0
+    retries = 0
+    raw_response = ""
+
+    local_plan = _build_local_fastpath_plan(task)
+    if local_plan is not None:
+        plan = local_plan
+        context.router_decision = "local_fastpath"
+        context.router_confidence = 1.0
+        emit("[VOCO] Using local fast-path for basic OS command.", "info")
+    elif _is_conversational_prompt(task):
+        context.router_decision = "llm_conversation"
+        context.router_confidence = 0.95
+        emit("[VOCO] Checking Ollama connection...", "info")
+        if not check_ollama_running():
+            error_msg = (
+                "Conversation model is unavailable. "
+                f"Run: ollama serve && ollama pull {OLLAMA_MODEL}"
+            )
+            emit(f"[VOCO] ERROR: {error_msg}", "error")
+            _log_execution(
+                task=task,
+                success=False,
+                steps_completed=0,
+                format_failures=0,
+                retries=0,
+                final_output=error_msg,
+                error=error_msg,
+                elapsed_seconds=round(time.time() - start_time, 1),
+                router_decision=context.router_decision,
+                router_confidence=context.router_confidence,
+                model_used="none",
+            )
+            return error_msg
+
+        emit("[VOCO] Generating conversational response...", "info")
+        conversation_ok, conversation_reply = generate_conversation(user_message=task)
+        model_used = get_last_model_used()
+        emit(f"[VOCO] Model selected: {model_used} (num_ctx={get_last_num_ctx_used()})", "info")
+        elapsed = round(time.time() - start_time, 1)
+
+        if conversation_ok:
+            summary = f"[VOCO] OK {conversation_reply}"
+            emit(summary, "success")
+            _log_execution(
+                task=task,
+                success=True,
+                steps_completed=0,
+                format_failures=0,
+                retries=0,
+                final_output=conversation_reply,
+                error=None,
+                elapsed_seconds=elapsed,
+                router_decision=context.router_decision,
+                router_confidence=context.router_confidence,
+                model_used=model_used,
+            )
+            return summary
+
+        error_msg = f"Task cannot be completed: {conversation_reply}"
+        emit(f"[VOCO] ERROR: {error_msg}", "error")
+        _log_execution(
+            task=task,
+            success=False,
+            steps_completed=0,
+            format_failures=0,
+            retries=0,
+            final_output=error_msg,
+            error=conversation_reply,
+            elapsed_seconds=elapsed,
+            router_decision=context.router_decision,
+            router_confidence=context.router_confidence,
+            model_used=model_used,
+        )
+        return error_msg
+    else:
+        context.router_decision = "llm_plan"
+        context.router_confidence = 0.9
+        emit("[VOCO] Checking Ollama connection...", "info")
+        if not check_ollama_running():
+            error_msg = (
+                "Ollama is not running or no local model is available. "
+                f"Run: ollama serve && ollama pull {OLLAMA_MODEL}"
+            )
+            emit(f"[VOCO] ERROR: {error_msg}", "error")
+            _log_execution(
+                task=task,
+                success=False,
+                steps_completed=0,
+                format_failures=0,
+                retries=0,
+                final_output=error_msg,
+                error=error_msg,
+                elapsed_seconds=round(time.time() - start_time, 1),
+                router_decision=context.router_decision,
+                router_confidence=context.router_confidence,
+                model_used="none",
+            )
+            return error_msg
+
+        emit("[VOCO] Building context...", "info")
+        system_prompt = build_system_prompt(context)
+
+        emit("[VOCO] Generating action plan...", "info")
+        raw_response = generate(system_prompt=system_prompt, user_message=task)
+        model_used = get_last_model_used()
+        emit(f"[VOCO] Model selected: {model_used} (num_ctx={get_last_num_ctx_used()})", "info")
+        status, plan = parse_response(raw_response)
+
+        if status == "format_failure":
+            format_failures += 1
+            emit("[VOCO] Format issue detected. Requesting correction...", "info")
+            correction_messages = [
+                {"role": "user", "content": task},
+                {"role": "assistant", "content": raw_response},
+                {"role": "user", "content": build_correction_prompt()},
+            ]
+            corrected_response = generate_with_history(system_prompt, correction_messages)
+            retries += 1
+            model_used = get_last_model_used()
+            emit(f"[VOCO] Correction model: {model_used} (num_ctx={get_last_num_ctx_used()})", "info")
+            status, plan = parse_response(corrected_response)
+            _log_format_failure(
+                task=task,
+                raw_response=raw_response,
+                corrected_response=corrected_response,
+                correction_worked=(status == "ok"),
+                model_used=model_used,
+            )
+            raw_response = corrected_response
+
+        if status != "ok" or not plan:
+            error_msg = "Failed to generate a valid action plan."
+            emit(f"[VOCO] ERROR: {error_msg}", "error")
+            _log_execution(
+                task=task,
+                success=False,
+                steps_completed=0,
+                format_failures=format_failures,
+                retries=retries,
+                final_output=raw_response[:300],
+                error="plan_parse_failure",
+                elapsed_seconds=round(time.time() - start_time, 1),
+                router_decision=context.router_decision,
+                router_confidence=context.router_confidence,
+                model_used=model_used,
+            )
+            return error_msg
+
+    max_steps_to_run = min(len(plan), MAX_STEPS)
+    emit(f"[VOCO] Plan has {len(plan)} steps. Executing up to {max_steps_to_run}.", "info")
+
+    steps_completed = 0
+    execution_failed = False
+    final_output = ""
+
+    for index, step in enumerate(plan[:MAX_STEPS], start=1):
+        if not isinstance(step, dict):
+            result = {"status": "error", "result": None, "message": "Invalid step payload (expected object)."}
+            tool_name = "unknown"
+            tool_args = {}
+            reason = "invalid-step"
+        else:
+            tool_name = str(step.get("tool", "")).strip()
+            tool_args = step.get("args", {})
+            reason = str(step.get("reason", "")).strip()
+            if not isinstance(tool_args, dict):
+                result = {"status": "error", "result": None, "message": "Step args must be an object."}
+            elif tool_name not in TOOL_REGISTRY:
+                result = {"status": "error", "result": None, "message": f"Unknown tool: '{tool_name}'"}
+            else:
+                result = dispatch_tool(tool_name, tool_args)
+
+        context.steps.append(
+            {
+                "step": index,
+                "tool": tool_name,
+                "args": tool_args,
+                "reason": reason,
+            }
+        )
+        context.tool_results.append(
+            {
+                "step": index,
+                "tool": tool_name,
+                "args": tool_args,
+                "result": result,
+            }
+        )
+
+        emit(
+            f"[VOCO] Step {index}/{max_steps_to_run}: {tool_name}({_format_args_preview(tool_args)}) - {reason}",
+            "step",
+        )
+
+        if result["status"] == "success":
+            steps_completed += 1
+            final_output = result["message"]
+            emit(f"  OK {result['message']}", "success")
+            continue
+
+        if result["status"] == "failure":
+            final_output = result["message"]
+            emit(f"  FAIL {result['message']}", "error")
+            execution_failed = True
+            break
+
+        final_output = result["message"]
+        emit(f"  ERR {result['message']}", "error")
+        if index == max_steps_to_run:
+            execution_failed = True
+
+    if len(plan) > MAX_STEPS:
+        emit(f"[VOCO] Step limit ({MAX_STEPS}) reached. Task may be incomplete.", "info")
+        _write_incomplete_state(task=task, plan=plan, tool_results=context.tool_results)
+
+    success = steps_completed > 0 and not execution_failed
+    elapsed = round(time.time() - start_time, 1)
+
+    _log_execution(
+        task=task,
+        success=success,
+        steps_completed=steps_completed,
+        format_failures=format_failures,
+        retries=retries,
+        final_output=final_output,
+        error=None if success else "execution_error",
+        elapsed_seconds=elapsed,
+        router_decision=context.router_decision,
+        router_confidence=context.router_confidence,
+        model_used=model_used,
+    )
+
+    icon = "OK" if success else "FAIL"
+    summary = (
+        f"[VOCO] {icon} Task complete in {elapsed}s. "
+        f"Steps: {steps_completed}/{max_steps_to_run}. Result: {final_output}"
+    )
+    emit(summary, "success" if success else "error")
+    return summary
+
+
+def _format_args_preview(args: dict, max_length: int = 60) -> str:
+    if not args:
+        return ""
+    parts = [f"{key}={repr(value)[:20]}" for key, value in args.items()]
+    preview = ", ".join(parts)
+    if len(preview) > max_length:
+        return preview[:max_length] + "..."
+    return preview
+
+
+def _log_execution(
+    task: str,
+    success: bool,
+    steps_completed: int,
+    format_failures: int,
+    retries: int,
+    final_output: str,
+    error: str | None = None,
+    elapsed_seconds: float = 0.0,
+    router_decision: str = "unknown",
+    router_confidence: float = 0.0,
+    model_used: str = OLLAMA_MODEL,
+) -> None:
+    record = {
+        "timestamp": datetime.datetime.now().isoformat(),
+        "task": task,
+        "success": success,
+        "steps_completed": steps_completed,
+        "format_failures": format_failures,
+        "retries": retries,
+        "final_output": final_output[:300] if final_output else "",
+        "error": error,
+        "elapsed_seconds": elapsed_seconds,
+        "router_decision": router_decision,
+        "router_confidence": router_confidence,
+        "model": model_used,
+    }
+    append_event(record)
+
+
+def _log_format_failure(
+    task: str,
+    raw_response: str,
+    corrected_response: str,
+    correction_worked: bool,
+    model_used: str = OLLAMA_MODEL,
+) -> None:
+    record = {
+        "timestamp": datetime.datetime.now().isoformat(),
+        "task": task,
+        "raw_response": raw_response[:500],
+        "corrected_response": corrected_response[:500],
+        "correction_worked": correction_worked,
+        "model": model_used,
+    }
+    failure_path = os.path.abspath(FORMAT_FAILURE_LOG)
+    os.makedirs(os.path.dirname(failure_path), exist_ok=True)
+    with open(failure_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _write_incomplete_state(task: str, plan: list, tool_results: list) -> None:
+    incomplete_path = os.path.abspath(CONTEXT_FILE)
+    os.makedirs(os.path.dirname(incomplete_path), exist_ok=True)
+    last_message = ""
+    if tool_results:
+        last_result = tool_results[-1].get("result", {})
+        if isinstance(last_result, dict):
+            last_message = str(last_result.get("message", ""))
+    with open(incomplete_path, "a", encoding="utf-8") as f:
+        f.write(f"\n## Incomplete Task - {datetime.datetime.now().isoformat()}\n")
+        f.write(f"**Task:** {task}\n")
+        f.write(f"**Completed:** {len(tool_results)} steps\n")
+        f.write(f"**Last output:** {last_message}\n")
+        f.write(f"**Remaining steps:** {max(len(plan) - len(tool_results), 0)}\n\n")
+
+
+def _build_local_fastpath_plan(task: str) -> list[dict] | None:
+    """Return a direct tool plan for simple commands that do not require LLM planning."""
+    text = task.lower().strip()
+
+    unmute_patterns = [
+        r"\bun[-\s]?mute\b",
+        r"\bur[-\s]?mute\b",
+        r"\bturn on (?:the )?(?:system )?audio\b",
+        r"\baudio on\b",
+        r"\bsound on\b",
+    ]
+    if any(re.search(pattern, text) for pattern in unmute_patterns):
+        return [
+            {
+                "tool": "mute_audio",
+                "args": {"mute": False},
+                "reason": "Direct local command for unmuting system audio.",
+            }
+        ]
+
+    if re.search(r"\bmute\b", text):
+        return [
+            {
+                "tool": "mute_audio",
+                "args": {"mute": True},
+                "reason": "Direct local command for muting system audio.",
+            }
+        ]
+
+    if "take a screenshot" in text or "take screenshot" in text or "capture screenshot" in text:
+        return [
+            {
+                "tool": "take_screenshot",
+                "args": {},
+                "reason": "Direct local command for screenshot capture.",
+            }
+        ]
+
+    if "running apps" in text or "what apps are currently running" in text:
+        return [
+            {
+                "tool": "get_running_apps",
+                "args": {},
+                "reason": "Direct local command for listing active windows.",
+            }
+        ]
+
+    return None
+
+
+def _is_conversational_prompt(task: str) -> bool:
+    """Return True when the input should be handled as conversational chat."""
+    text = task.lower().strip()
+    if not text:
+        return True
+
+    conversational_patterns = [
+        r"^(hi+|hello|hey+)(\s+voco)?[!.?]*$",
+        r"^(thanks|thank you|thx)[!.?]*$",
+        r"^what(?:'s| is)\s+your\s+name[?.!]*$",
+        r"^who\s+are\s+you[?.!]*$",
+        r"^what\s+can\s+you\s+do[?.!]*$",
+        r"^how\s+are\s+you[?.!]*$",
+        r"^tell me about yourself[?.!]*$",
+    ]
+    return any(re.match(pattern, text) for pattern in conversational_patterns)
+</file>
+
+<file path="prompts/system.md">
+You are VOCO, a local autonomous coding agent running on the user's machine.
+You solve tasks step by step using tools. You have access to a sandboxed workspace directory.
+
+## Available Tools
+
+{{TOOLS}}
+
+## Memory (persistent context from previous sessions)
+
+{{MEMORY}}
+
+## Response Format
+
+You must respond in EXACTLY one of two formats:
+
+### Format 1 — Tool Call
+
+Use this when you need to call a tool:
+
+<tool_call>
+<tool>tool_name</tool>
+<args>{"arg1": "value1", "arg2": "value2"}</args>
+</tool_call>
+
+### Format 2 — Final Answer
+
+Use this when you have a complete answer or have finished the task:
+
+<final>
+Your response to the user here.
+</final>
+
+## Rules
+
+- Never access paths outside the workspace.
+- Only use tools listed above.
+- If a tool fails, read the error, reason about it, and retry with a fix.
+- Keep responses concise. No unnecessary explanation.
+- Always end with either a tool call or a <final> block. Never leave the response open-ended.
+</file>
+
+<file path="README.md">
+# VOCO - Local Windows Automation Agent
+
+<p align="center">
+  <img src="assets/voco-logo.png" alt="VOCO logo" width="260" />
+</p>
+
+![Python](https://img.shields.io/badge/Python-3.13-blue?logo=python)
+![Platform](https://img.shields.io/badge/Platform-Windows%2011-0078D6?logo=windows)
+![Runtime](https://img.shields.io/badge/LLM-Ollama-black?logo=ollama)
+![Status](https://img.shields.io/badge/Status-Active%20Development-orange)
+![Mode](https://img.shields.io/badge/Mode-Execution%20Only-green)
+
+VOCO is a **local-first AI assistant** for Windows.  
+It runs in terminal UI and tries to do tasks step by step (open apps, mute audio, screenshots, file tasks, browser tasks).
+
+---
+
+## UI Preview
+
+![VOCO UI Screenshot](assets/ui-screenshot.png)
+
+---
+
+## What VOCO is (simple)
+
+VOCO has 3 main parts:
+
+1. **UI (`voco_ui.py`)**  
+   You type commands in a clean terminal dashboard.
+2. **Orchestrator (`orchestrator.py`)**  
+   This is the brain loop. It decides what to run and executes tools.
+3. **Tools (`tools.py`)**  
+   Real actions like mute/unmute, screenshot, browser navigation, and file operations.
+
+---
+
+## What we completed
+
+We implemented the full Phase-1 build and major fixes:
+
+- Qwen/Ollama chat integration
+- JSON action-plan parser flow
+- Windows tool registry (browser + OS + file + profile tools)
+- TUI wired to real orchestrator in background thread
+- Evaluation pipeline (`eval.py`) with 20 prompts
+- Memory vault files in `memory/vault/`
+- Better UI logging (fixed garbled `[voco]` style output)
+- Better LLM error messages for HTTP 500 / timeout
+- **Local fast-path** for basic commands (`mute`, `un-mute`, screenshot, running apps)
+- **Dual-model selection + fallback logic** (fast vs heavy candidates)
+
+---
+
+## Important current behavior
+
+### 1) Basic commands now work fast without LLM
+For simple commands, VOCO bypasses model planning and executes directly.
+
+Examples:
+- `mute the system audio`
+- `un-mute the system audio`
+- `ur-mute the system audio` (typo handled)
+
+### 2) Hard commands still depend on local model health
+If your machine has low free RAM/VRAM, heavy model tasks can still fail or timeout.
+
+---
+
+## Known issue (current)
+
+On low-memory sessions, Ollama can return:
+
+- `HTTP 500: model requires more system memory ...`
+- or request timeout
+
+This is not a UI crash.  
+This is a model runtime resource issue.
+
+---
+
+## Quick start
+
+## 1) Install dependencies
+
+```powershell
+pip install playwright pyautogui pygetwindow pywin32 pynput keyboard pyyaml scikit-learn joblib textual rich pillow pytesseract pywinauto requests
+python -m playwright install chromium
+```
+
+## 2) Ensure Ollama is running
+
+```powershell
+ollama serve
+```
+
+If you can, install at least one smaller model for fallback:
+
+```powershell
+ollama pull qwen2.5:1.5b
+```
+
+## 3) Run VOCO UI
+
+```powershell
+python voco_ui.py
+```
+
+---
+
+## Project structure
+
+```text
+Sem4-AIOT/
+├── readme.md
+├── voco_ui.py
+├── orchestrator.py
+├── llm.py
+├── tools.py
+├── _prompt.py
+├── context.py
+├── memory.py
+├── constants.py
+├── eval.py
+├── memory/
+│   └── vault/
+│       ├── USER.yaml
+│       ├── HISTORY.jsonl
+│       ├── CONTEXT.md
+│       └── failures.jsonl
+└── assets/
+    ├── ui-screenshot.png
+    └── voco-logo.png
+```
+
+---
+
+## Evaluation snapshot
+
+From the first full 20-prompt run:
+
+- Success rate: **5.0%**
+- Format failure rate: **95.0%**
+- Main blocker: model timeout / memory pressure
+
+This is why local fast-path and model fallback were added.
+
+---
+
+## Next best technical steps
+
+1. Install at least one small fallback model (`qwen2.5:1.5b` or `qwen2.5:0.5b`)
+2. Add stronger intent routing for more local actions
+3. Add command queue + cancellation in UI
+4. Improve browser tool reliability and selector strategies
+5. Re-run `python eval.py` and compare new metrics
+
+---
+
+## Final note
+
+VOCO is now much more usable for daily basic commands on this device.  
+For complex tasks, stability still depends on Ollama model memory headroom.
+</file>
+
+<file path="sandbox.py">
+"""Workspace sandbox — enforces path jail and extension allowlist."""
+
+from pathlib import Path
+
+from constants import WORKSPACE_PATH, ALLOWED_EXTENSIONS
+
+
+class SandboxViolation(Exception):
+    """Raised when a tool attempts to access a path outside the sandbox."""
+
+
+def safe_path(raw: str) -> Path:
+    """
+    Resolve a path and verify it is inside WORKSPACE_PATH.
+
+    Parameters
+    ----------
+    raw : str
+        Path string provided by the LLM (may be relative or absolute).
+
+    Returns
+    -------
+    Path
+        Absolute resolved path guaranteed to be inside the workspace.
+
+    Raises
+    ------
+    SandboxViolation
+        If the resolved path escapes the workspace or has a disallowed extension.
+    """
+    workspace = WORKSPACE_PATH.resolve()
+    workspace.mkdir(parents=True, exist_ok=True)
+
+    # Treat all paths as relative to workspace unless already absolute inside it
+    candidate = Path(raw)
+    if not candidate.is_absolute():
+        candidate = workspace / candidate
+
+    resolved = candidate.resolve()
+
+    # Path jail check
+    try:
+        resolved.relative_to(workspace)
+    except ValueError:
+        raise SandboxViolation(
+            f"Path '{raw}' resolves outside workspace: {resolved}"
+        )
+
+    # Extension allowlist
+    if resolved.suffix and resolved.suffix.lower() not in ALLOWED_EXTENSIONS:
+        raise SandboxViolation(
+            f"Extension '{resolved.suffix}' is not permitted. "
+            f"Allowed: {', '.join(sorted(ALLOWED_EXTENSIONS))}"
+        )
+
+    return resolved
+</file>
+
+<file path="tools.py">
+"""
+VOCO Tools - Windows OS automation tool library.
+Every tool returns:
+{"status": "success" | "error" | "failure", "result": any, "message": str}
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import time
+from collections import deque
+from pathlib import Path
+from urllib.parse import quote_plus
+
+import yaml
+
+from constants import USER_PROFILE_FILE, WORKSPACE_PATH
+
+try:
+    import pyautogui
+
+    pyautogui.FAILSAFE = True
+    PYAUTOGUI_AVAILABLE = True
+except ImportError:
+    PYAUTOGUI_AVAILABLE = False
+
+try:
+    import pygetwindow as gw
+
+    PYGETWINDOW_AVAILABLE = True
+except ImportError:
+    PYGETWINDOW_AVAILABLE = False
+
+try:
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+    from playwright.sync_api import sync_playwright
+
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
+
+
+_playwright_instance = None
+_browser_instance = None
+_page_instance = None
+_mute_state: bool | None = None
+
+
+def _ok(result, message: str) -> dict:
+    return {"status": "success", "result": result, "message": message}
+
+
+def _err(message: str) -> dict:
+    return {"status": "error", "result": None, "message": message}
+
+
+def _workspace_root() -> Path:
+    root = WORKSPACE_PATH.resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _resolve_workspace_path(path: str, allow_missing_parent: bool = False) -> Path:
+    root = _workspace_root()
+    candidate = Path(path)
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    resolved = candidate.resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"Path escapes workspace: {path}") from exc
+    if not allow_missing_parent and not resolved.exists():
+        raise FileNotFoundError(f"Path not found: {resolved}")
+    return resolved
+
+
+def _get_browser_page():
+    global _playwright_instance, _browser_instance, _page_instance
+    if not PLAYWRIGHT_AVAILABLE:
+        raise RuntimeError(
+            "Playwright not installed. Run: pip install playwright && python -m playwright install chromium"
+        )
+
+    if _page_instance is None or _page_instance.is_closed():
+        if _playwright_instance is None:
+            _playwright_instance = sync_playwright().start()
+        if _browser_instance is None or not _browser_instance.is_connected():
+            _browser_instance = _playwright_instance.chromium.launch(
+                headless=False,
+                args=["--start-maximized"],
+            )
+        _page_instance = _browser_instance.new_page()
+    return _page_instance
+
+
+def open_browser(url: str = "https://www.google.com", browser: str = "chromium") -> dict:
+    _ = browser
+    try:
+        page = _get_browser_page()
+        page.goto(url, wait_until="domcontentloaded", timeout=15000)
+        return _ok(
+            {"url": page.url, "title": page.title()},
+            f"Opened browser at {page.url}",
+        )
+    except PlaywrightTimeoutError:
+        return _err(f"Browser navigation timed out for URL: {url}")
+    except Exception as exc:
+        return _err(f"Browser open failed: {exc}")
+
+
+def navigate_to(url: str) -> dict:
+    try:
+        page = _get_browser_page()
+        page.goto(url, wait_until="domcontentloaded", timeout=15000)
+        return _ok(
+            {"url": page.url, "title": page.title()},
+            f"Navigated to {page.url}",
+        )
+    except PlaywrightTimeoutError:
+        return _err(f"Navigation timed out for URL: {url}")
+    except Exception as exc:
+        return _err(f"Navigation failed: {exc}")
+
+
+def search_youtube(query: str) -> dict:
+    try:
+        page = _get_browser_page()
+        search_url = f"https://www.youtube.com/results?search_query={quote_plus(query)}"
+        page.goto(search_url, wait_until="domcontentloaded", timeout=15000)
+        page.wait_for_selector("ytd-video-renderer #video-title", timeout=10000)
+        first_result = page.query_selector("ytd-video-renderer #video-title")
+        if first_result is None:
+            return _err("No YouTube results found.")
+        title = first_result.inner_text().strip()
+        href = first_result.get_attribute("href") or ""
+        full_url = f"https://www.youtube.com{href}" if href.startswith("/") else href
+        return _ok({"title": title, "url": full_url}, f"Found top YouTube result: {title}")
+    except PlaywrightTimeoutError:
+        return _err("YouTube results did not load in time.")
+    except Exception as exc:
+        return _err(f"YouTube search failed: {exc}")
+
+
+def click_youtube_first_result() -> dict:
+    try:
+        page = _get_browser_page()
+        first_link = page.query_selector("ytd-video-renderer #video-title")
+        if first_link is None:
+            return _err("No clickable YouTube result found.")
+        first_link.click()
+        page.wait_for_load_state("domcontentloaded", timeout=15000)
+        return _ok(
+            {"url": page.url, "title": page.title()},
+            f"Opened first YouTube result: {page.title()}",
+        )
+    except PlaywrightTimeoutError:
+        return _err("Timed out while opening the first YouTube result.")
+    except Exception as exc:
+        return _err(f"Click failed: {exc}")
+
+
+def web_search(query: str, engine: str = "google") -> dict:
+    engine_normalized = engine.strip().lower()
+    if engine_normalized not in {"google", "bing"}:
+        return _err("Unsupported engine. Use 'google' or 'bing'.")
+    try:
+        page = _get_browser_page()
+        if engine_normalized == "google":
+            page.goto(
+                f"https://www.google.com/search?q={quote_plus(query)}",
+                wait_until="domcontentloaded",
+                timeout=15000,
+            )
+            items = page.query_selector_all("div.yuRUbf > a")[:5]
+            results = []
+            for item in items:
+                title = item.inner_text().strip()
+                href = item.get_attribute("href")
+                if title:
+                    results.append({"title": title, "url": href})
+        else:
+            page.goto(
+                f"https://www.bing.com/search?q={quote_plus(query)}",
+                wait_until="domcontentloaded",
+                timeout=15000,
+            )
+            items = page.query_selector_all("li.b_algo h2 a")[:5]
+            results = [
+                {"title": item.inner_text().strip(), "url": item.get_attribute("href")}
+                for item in items
+                if item.inner_text().strip()
+            ]
+        return _ok(results, f"Found {len(results)} search results for '{query}'.")
+    except PlaywrightTimeoutError:
+        return _err(f"Web search timed out for query: {query}")
+    except Exception as exc:
+        return _err(f"Web search failed: {exc}")
+
+
+def type_in_browser(text: str, selector: str | None = None) -> dict:
+    try:
+        page = _get_browser_page()
+        if selector:
+            target = page.wait_for_selector(selector, timeout=5000)
+            target.fill(text)
+        else:
+            page.keyboard.type(text)
+        return _ok({"typed": text, "selector": selector}, f"Typed text in browser: {text}")
+    except PlaywrightTimeoutError:
+        return _err(f"Browser selector not found: {selector}")
+    except Exception as exc:
+        return _err(f"Browser typing failed: {exc}")
+
+
+def press_key_in_browser(key: str) -> dict:
+    try:
+        page = _get_browser_page()
+        page.keyboard.press(key)
+        return _ok({"key": key}, f"Pressed browser key: {key}")
+    except Exception as exc:
+        return _err(f"Browser key press failed: {exc}")
+
+
+def get_page_content() -> dict:
+    try:
+        page = _get_browser_page()
+        content = page.inner_text("body")[:3000]
+        return _ok({"url": page.url, "content": content}, f"Captured page text from {page.url}")
+    except Exception as exc:
+        return _err(f"Failed to capture page content: {exc}")
+
+
+def open_app(app_name: str) -> dict:
+    app_map = {
+        "notepad": "notepad.exe",
+        "calculator": "calc.exe",
+        "paint": "mspaint.exe",
+        "explorer": "explorer.exe",
+        "settings": "ms-settings:",
+        "task manager": "taskmgr.exe",
+        "cmd": "cmd.exe",
+        "powershell": "powershell.exe",
+        "vs code": "code",
+        "vscode": "code",
+        "chrome": "chrome.exe",
+        "firefox": "firefox.exe",
+        "edge": "msedge.exe",
+    }
+    executable = app_map.get(app_name.strip().lower(), app_name)
+    try:
+        if executable.startswith("ms-"):
+            subprocess.Popen(["start", "", executable], shell=True)
+        else:
+            subprocess.Popen(executable, shell=True)
+        time.sleep(1.0)
+        return _ok({"app": app_name, "executable": executable}, f"Opened application: {app_name}")
+    except FileNotFoundError:
+        return _err(f"Application not found: {app_name}")
+    except Exception as exc:
+        return _err(f"Failed to open app '{app_name}': {exc}")
+
+
+def get_running_apps() -> dict:
+    if not PYGETWINDOW_AVAILABLE:
+        return _err("pygetwindow is not installed.")
+    try:
+        windows = gw.getAllTitles()
+        visible = [title for title in windows if title.strip() and not title.startswith("Default IME")]
+        return _ok(visible, f"Found {len(visible)} running windows.")
+    except Exception as exc:
+        return _err(f"Failed to list running apps: {exc}")
+
+
+def focus_window(window_title: str) -> dict:
+    if not PYGETWINDOW_AVAILABLE:
+        return _err("pygetwindow is not installed.")
+    try:
+        matches = gw.getWindowsWithTitle(window_title)
+        if not matches:
+            return _err(f"No window found containing title: {window_title}")
+        window = matches[0]
+        window.activate()
+        time.sleep(0.2)
+        return _ok({"title": window.title}, f"Focused window: {window.title}")
+    except Exception as exc:
+        return _err(f"Focus window failed: {exc}")
+
+
+def type_text(text: str) -> dict:
+    if not PYAUTOGUI_AVAILABLE:
+        return _err("pyautogui is not installed.")
+    try:
+        pyautogui.write(text, interval=0.02)
+        return _ok({"typed": text}, f"Typed text: {text}")
+    except Exception as exc:
+        return _err(f"OS typing failed: {exc}")
+
+
+def press_key(key: str) -> dict:
+    if not PYAUTOGUI_AVAILABLE:
+        return _err("pyautogui is not installed.")
+    try:
+        if "+" in key:
+            keys = [k.strip() for k in key.split("+") if k.strip()]
+            pyautogui.hotkey(*keys)
+        else:
+            pyautogui.press(key)
+        return _ok({"key": key}, f"Pressed key: {key}")
+    except Exception as exc:
+        return _err(f"OS key press failed: {exc}")
+
+
+def click_at(x: int, y: int) -> dict:
+    if not PYAUTOGUI_AVAILABLE:
+        return _err("pyautogui is not installed.")
+    try:
+        pyautogui.click(int(x), int(y))
+        return _ok({"x": int(x), "y": int(y)}, f"Clicked at ({int(x)}, {int(y)})")
+    except Exception as exc:
+        return _err(f"OS click failed: {exc}")
+
+
+def take_screenshot(filename: str | None = None) -> dict:
+    if not PYAUTOGUI_AVAILABLE:
+        return _err("pyautogui is not installed.")
+    try:
+        workspace = _workspace_root()
+        name = filename if filename else f"screenshot_{int(time.time())}.png"
+        target = _resolve_workspace_path(name, allow_missing_parent=True)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        image = pyautogui.screenshot()
+        image.save(target)
+        return _ok({"filepath": str(target)}, f"Screenshot saved to {target}")
+    except Exception as exc:
+        return _err(f"Screenshot failed: {exc}")
+
+
+def run_shell_command(command: str, shell: str = "powershell") -> dict:
+    blocked_patterns = ["format ", "del /f", "rm -rf", "rmdir /s", "shutdown", "reg delete"]
+    lower_command = command.lower()
+    for pattern in blocked_patterns:
+        if pattern in lower_command:
+            return _err(f"Command blocked for safety: contains '{pattern}'.")
+    try:
+        if shell.strip().lower() == "powershell":
+            proc = subprocess.run(
+                ["powershell", "-Command", command],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        else:
+            proc = subprocess.run(
+                command,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        output = (proc.stdout or proc.stderr or "").strip()
+        if proc.returncode != 0:
+            return _err(f"Command failed (exit {proc.returncode}): {output[:500]}")
+        return _ok({"output": output[:2000], "returncode": proc.returncode}, "Command executed successfully.")
+    except subprocess.TimeoutExpired:
+        return _err("Command timed out after 15 seconds.")
+    except Exception as exc:
+        return _err(f"Shell execution failed: {exc}")
+
+
+def mute_audio(mute: bool = True) -> dict:
+    global _mute_state
+    try:
+        if not PYAUTOGUI_AVAILABLE:
+            return _err("pyautogui is not installed.")
+        if _mute_state is None:
+            pyautogui.press("volumemute")
+            _mute_state = mute
+            return _ok({"muted": _mute_state}, "Toggled system mute (initial state inferred).")
+        if mute != _mute_state:
+            pyautogui.press("volumemute")
+            _mute_state = mute
+        return _ok({"muted": _mute_state}, f"System audio mute state requested: {mute}")
+    except Exception as exc:
+        return _err(f"Mute control failed: {exc}")
+
+
+def read_file(path: str) -> dict:
+    try:
+        target = _resolve_workspace_path(path)
+        if not target.is_file():
+            return _err(f"Path is not a file: {target}")
+        with open(target, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+        return _ok({"path": str(target), "content": content[:5000]}, f"Read {len(content)} chars from {target}")
+    except Exception as exc:
+        return _err(f"Read failed: {exc}")
+
+
+def write_file(path: str, content: str) -> dict:
+    try:
+        target = _resolve_workspace_path(path, allow_missing_parent=True)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with open(target, "w", encoding="utf-8") as f:
+            f.write(content)
+        return _ok({"path": str(target), "bytes": len(content)}, f"Wrote {len(content)} chars to {target}")
+    except Exception as exc:
+        return _err(f"Write failed: {exc}")
+
+
+def list_files(directory: str = "workspace", depth: int = 2) -> dict:
+    try:
+        if directory == "workspace":
+            root = _workspace_root()
+        else:
+            root = _resolve_workspace_path(directory)
+            if not root.is_dir():
+                return _err(f"Path is not a directory: {root}")
+        max_depth = max(0, int(depth))
+
+        queue: deque[tuple[Path, int]] = deque([(root, 0)])
+        items: list[dict] = []
+        while queue:
+            current, current_depth = queue.popleft()
+            try:
+                entries = sorted(current.iterdir(), key=lambda entry: (entry.is_file(), entry.name.lower()))
+            except PermissionError:
+                continue
+            for entry in entries:
+                rel_path = str(entry.relative_to(root))
+                if entry.is_dir():
+                    items.append({"path": rel_path + "\\", "type": "dir"})
+                    if current_depth < max_depth:
+                        queue.append((entry, current_depth + 1))
+                else:
+                    items.append(
+                        {
+                            "path": rel_path,
+                            "type": "file",
+                            "size_bytes": entry.stat().st_size,
+                        }
+                    )
+        return _ok(items, f"Found {len(items)} entries in {root} (BFS depth={max_depth}).")
+    except Exception as exc:
+        return _err(f"List files failed: {exc}")
+
+
+def update_user_profile(key: str, value: str) -> dict:
+    try:
+        profile_path = Path(USER_PROFILE_FILE)
+        profile_path.parent.mkdir(parents=True, exist_ok=True)
+        profile = {}
+        if profile_path.exists():
+            with open(profile_path, "r", encoding="utf-8") as f:
+                existing = f.read()
+            loaded = yaml.safe_load(existing) if existing.strip() else {}
+            if isinstance(loaded, dict):
+                profile = loaded
+        profile[key] = value
+        with open(profile_path, "w", encoding="utf-8") as f:
+            yaml.dump(profile, f, default_flow_style=False, allow_unicode=True, sort_keys=True)
+        return _ok({key: value}, f"Updated user profile: {key} = {value}")
+    except Exception as exc:
+        return _err(f"Profile update failed: {exc}")
+
+
+def report_failure(reason: str) -> dict:
+    return {"status": "failure", "result": {"reason": reason}, "message": f"Task cannot be completed: {reason}"}
+
+
+TOOL_REGISTRY = {
+    "open_browser": {
+        "fn": open_browser,
+        "description": "Open a browser and navigate to a URL.",
+        "args": {"url": "string (optional)", "browser": "string (optional)"},
+    },
+    "navigate_to": {
+        "fn": navigate_to,
+        "description": "Navigate the active browser page to a URL.",
+        "args": {"url": "string"},
+    },
+    "search_youtube": {
+        "fn": search_youtube,
+        "description": "Search YouTube and return the top result title and URL.",
+        "args": {"query": "string"},
+    },
+    "click_youtube_first_result": {
+        "fn": click_youtube_first_result,
+        "description": "Click the first video result on a YouTube search page.",
+        "args": {},
+    },
+    "web_search": {
+        "fn": web_search,
+        "description": "Run a web search and return top results.",
+        "args": {"query": "string", "engine": "string (optional: google/bing)"},
+    },
+    "type_in_browser": {
+        "fn": type_in_browser,
+        "description": "Type text in browser focus or a CSS selector target.",
+        "args": {"text": "string", "selector": "string (optional)"},
+    },
+    "press_key_in_browser": {
+        "fn": press_key_in_browser,
+        "description": "Press a keyboard key in the active browser page.",
+        "args": {"key": "string"},
+    },
+    "get_page_content": {
+        "fn": get_page_content,
+        "description": "Get visible text content from the active browser page.",
+        "args": {},
+    },
+    "open_app": {
+        "fn": open_app,
+        "description": "Open a Windows desktop app by common name or executable.",
+        "args": {"app_name": "string"},
+    },
+    "get_running_apps": {
+        "fn": get_running_apps,
+        "description": "List active window titles.",
+        "args": {},
+    },
+    "focus_window": {
+        "fn": focus_window,
+        "description": "Bring a window to foreground by partial title.",
+        "args": {"window_title": "string"},
+    },
+    "type_text": {
+        "fn": type_text,
+        "description": "Type text at current OS focus.",
+        "args": {"text": "string"},
+    },
+    "press_key": {
+        "fn": press_key,
+        "description": "Press an OS key or hotkey (example: ctrl+c).",
+        "args": {"key": "string"},
+    },
+    "click_at": {
+        "fn": click_at,
+        "description": "Click at screen coordinates (last resort).",
+        "args": {"x": "integer", "y": "integer"},
+    },
+    "take_screenshot": {
+        "fn": take_screenshot,
+        "description": "Capture a screenshot into the workspace.",
+        "args": {"filename": "string (optional)"},
+    },
+    "run_shell_command": {
+        "fn": run_shell_command,
+        "description": "Run a shell command and return output.",
+        "args": {"command": "string", "shell": "string (optional: powershell/cmd)"},
+    },
+    "mute_audio": {
+        "fn": mute_audio,
+        "description": "Mute or unmute system audio.",
+        "args": {"mute": "boolean (true/false)"},
+    },
+    "read_file": {
+        "fn": read_file,
+        "description": "Read a file inside the workspace.",
+        "args": {"path": "string"},
+    },
+    "write_file": {
+        "fn": write_file,
+        "description": "Write a file inside the workspace.",
+        "args": {"path": "string", "content": "string"},
+    },
+    "list_files": {
+        "fn": list_files,
+        "description": "List files/dirs in BFS order inside workspace.",
+        "args": {"directory": "string (optional)", "depth": "integer (optional)"},
+    },
+    "update_user_profile": {
+        "fn": update_user_profile,
+        "description": "Update one user profile field in USER.yaml.",
+        "args": {"key": "string", "value": "string"},
+    },
+    "report_failure": {
+        "fn": report_failure,
+        "description": "Signal that a task cannot be completed with available tools.",
+        "args": {"reason": "string"},
+    },
+}
+
+
+def dispatch_tool(name: str, args: dict) -> dict:
+    """Dispatch a registered tool by name and return its structured result."""
+    if name not in TOOL_REGISTRY:
+        return _err(f"Unknown tool: '{name}'. Available: {', '.join(TOOL_REGISTRY.keys())}")
+    if args is None:
+        args = {}
+    if not isinstance(args, dict):
+        return _err("Tool arguments must be a JSON object.")
+
+    cleaned_args = {}
+    for key, value in args.items():
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in {"true", "false"}:
+                cleaned_args[key] = lowered == "true"
+                continue
+            if lowered.isdigit():
+                cleaned_args[key] = int(lowered)
+                continue
+            try:
+                cleaned_args[key] = float(lowered)
+                continue
+            except ValueError:
+                pass
+        cleaned_args[key] = value
+
+    tool_fn = TOOL_REGISTRY[name]["fn"]
+    try:
+        result = tool_fn(**cleaned_args)
+    except TypeError as exc:
+        return _err(f"Wrong arguments for '{name}': {exc}")
+    except Exception as exc:
+        return _err(f"Tool execution error in '{name}': {exc}")
+
+    if not isinstance(result, dict) or "status" not in result:
+        return _err(f"Tool '{name}' returned an invalid result payload.")
+    return result
+</file>
+
+<file path="voco_ui.py">
+"""VOCO TUI frontend prototype using Textual (no backend logic)."""
+
+import asyncio
+import threading
+from rich.markup import escape
+from rich.text import Text
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import Container, Horizontal, Vertical
+from textual.widgets import Footer, Input, Label, RichLog, Rule, Static
+
+from context import AgentContext
+from orchestrator import run as orchestrator_run
+
+
+_agent_context = AgentContext()
+
+
+class VocoApp(App):
+    """Modern minimalist VOCO dashboard mockup."""
+
+    TITLE = "VOCO"
+    SUB_TITLE = "Autonomous Agent Prototype"
+
+    BINDINGS = [
+        Binding("ctrl+g", "voice_toggle", "Voice", show=True, priority=True),
+        Binding("q", "quit", "Quit", show=True),
+    ]
+
+    # Mascot — 2 frames: eyes open / blink.
+    MASCOT_FRAMES = [
+        # Frame 0 — eyes open
+        (
+            "    ▄▄▄▄▄▄▄\n"
+            "   █ ■   ■ █\n"
+            "   █  ─ ─  █\n"
+            "   █▄▄▄▄▄▄▄█\n"
+            "   ▐█▌   ▐█▌"
+        ),
+        # Frame 1 — blink (eyes closed)
+        (
+            "    ▄▄▄▄▄▄▄\n"
+            "   █ ─   ─ █\n"
+            "   █  ─ ─  █\n"
+            "   █▄▄▄▄▄▄▄█\n"
+            "   ▐█▌   ▐█▌"
+        ),
+    ]
+
+    # Textual CSS controls almost the entire visual identity of this prototype.
+    # Palette is intentionally muted and modern to avoid retro terminal styling.
+    CSS = """
+    Screen {
+        background: #000000;
+        color: #D4D4D4;
+        align: center middle;
+    }
+
+    #root {
+        width: 100%;
+        height: 100%;
+        align-horizontal: center;
+        padding: 1 2;
+    }
+
+    #upper-zone {
+        width: 86;
+        max-width: 90;
+        min-height: 20;
+        height: 1fr;
+    }
+
+    #dashboard {
+        width: 100%;
+        border: dashed #C96B45;
+        border-title-color: #C96B45;
+        border-title-style: bold;
+        background: #000000;
+        padding: 1 2;
+    }
+
+    #dashboard-row {
+        width: 100%;
+        height: 1fr;
+    }
+
+    #left-column {
+        width: 1fr;
+        content-align: center middle;
+        padding: 1 1;
+    }
+
+    #left-column .welcome {
+        color: #D4D4D4;
+        text-style: bold;
+        margin-bottom: 1;
+    }
+
+    #mascot {
+        color: #C96B45;
+        text-style: bold;
+        text-align: center;
+        margin: 1 0;
+    }
+
+    #left-column .meta {
+        color: #7E7E81;
+    }
+
+    #right-column {
+        width: 1fr;
+        padding: 1 1;
+    }
+
+    #right-column Rule {
+        color: #C96B45;
+        margin: 0 0 1 0;
+    }
+
+    .section-title {
+        color: #C96B45;
+        text-style: bold;
+        margin-bottom: 1;
+    }
+
+    .item {
+        color: #D4D4D4;
+        margin: 0 0 1 0;
+    }
+
+    .time {
+        color: #7E7E81;
+    }
+
+    #conversation {
+        width: 100%;
+        height: 10;
+        display: block;
+        border-top: dashed #3A3A3A;
+        padding: 0 1;
+    }
+
+    #chat-log {
+        width: 100%;
+        height: 100%;
+        border: none;
+        background: transparent;
+        color: #D4D4D4;
+        padding: 0;
+        scrollbar-color: #C96B45;
+        scrollbar-background: #000000;
+    }
+
+    #divider {
+        width: 86;
+        max-width: 90;
+        color: #7E7E81;
+    }
+
+    #prompt-row {
+        width: 86;
+        max-width: 90;
+        height: 3;
+        align: left middle;
+        background: transparent;
+    }
+
+    #hotkeys-inline {
+        width: auto;
+        color: #C96B45;
+        text-style: bold;
+        padding: 0 0 0 2;
+    }
+
+    #prompt-prefix {
+        width: auto;
+        color: #D4D4D4;
+        padding: 0 1 0 0;
+        text-style: bold;
+    }
+
+    #command-input {
+        width: 1fr;
+        border: none;
+        background: transparent;
+        color: #D4D4D4;
+        padding: 0;
+    }
+
+    #command-input:focus {
+        border: none;
+        background: transparent;
+    }
+
+    Footer {
+        background: #000000;
+        color: #9CA3AF;
+        dock: bottom;
+    }
+
+    Footer .footer--key {
+        color: #C96B45;
+    }
+
+    Footer .footer--description {
+        color: #D4D4D4;
+    }
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._mascot_index = 0
+
+    def compose(self) -> ComposeResult:
+        # The UI is split into three vertical bands:
+        # 1) Upper content zone (dashboard or conversation stream)
+        # 2) A subtle horizontal divider line
+        # 3) A clean borderless command prompt row
+        with Vertical(id="root"):
+            with Container(id="upper-zone"):
+                # Initial dashboard view shown before the first submitted command.
+                with Container(id="dashboard"):
+                    with Horizontal(id="dashboard-row"):
+                        # Left identity/status column.
+                        with Vertical(id="left-column"):
+                            yield Label("Welcome back, Developer!", classes="welcome")
+                            yield Static(self.MASCOT_FRAMES[0], id="mascot")
+                            yield Label("Qwen 2.5 Coder • Local LLM", classes="meta")
+                            yield Label("/workspace/voco/apps", classes="meta")
+
+                        # Right activity/information column.
+                        with Vertical(id="right-column"):
+                            yield Label("Recent activity", classes="section-title")
+                            yield Label("[#7E7E81]1m ago[/]  Updated system memory", classes="item")
+                            yield Label("[#7E7E81]4m ago[/]  Synced local toolchain", classes="item")
+                            yield Label("[#7E7E81]9m ago[/]  Indexed workspace files", classes="item")
+                            yield Rule()
+                            yield Label("What's new", classes="section-title")
+                            yield Label("/agents  — spawn sub-agents", classes="item")
+                            yield Label("/help    — list all commands", classes="item")
+                            yield Label("/workspace — view workspace", classes="item")
+
+                # Conversation log remains visible and scrollable under dashboard.
+                with Container(id="conversation"):
+                    yield RichLog(id="chat-log", markup=True, highlight=False, wrap=True)
+
+            yield Rule(id="divider")
+
+            with Horizontal(id="prompt-row"):
+                yield Label(">", id="prompt-prefix")
+                yield Input(placeholder='Try "edit <filepath> to ..."', id="command-input")
+                yield Label("^G Voice   Q Quit", id="hotkeys-inline")
+
+            yield Footer()
+
+    def on_mount(self) -> None:
+        # Border title is set at runtime to keep string formatting explicit.
+        self.query_one("#dashboard", Container).border_title = " VOCO v1.0.0 "
+        self.query_one("#command-input", Input).focus()
+        self.set_interval(1.2, self._animate_mascot)
+
+    def _animate_mascot(self) -> None:
+        """Animate mascot while dashboard is visible for subtle liveliness."""
+        dashboard = self.query_one("#dashboard", Container)
+        if not dashboard.display:
+            return
+
+        self._mascot_index = (self._mascot_index + 1) % len(self.MASCOT_FRAMES)
+        self.query_one("#mascot", Static).update(self.MASCOT_FRAMES[self._mascot_index])
+
+    def _activate_conversation(self) -> RichLog:
+        """Return the chat log widget while keeping the dashboard visible."""
+        return self.query_one("#chat-log", RichLog)
+
+    def _render_help(self, chat_log: RichLog) -> None:
+        """Render available mock commands for the prototype."""
+        chat_log.write(Text("[VOCO] Available Commands", style="#C96B45"))
+        chat_log.write(Text("  /help             Show command list", style="#D4D4D4"))
+        chat_log.write(Text("  /agents           Spawn mock sub-agent", style="#D4D4D4"))
+        chat_log.write(Text("  /security-review  Start mock security pass", style="#D4D4D4"))
+        chat_log.write(Text("  /resume           Continue last workflow", style="#D4D4D4"))
+        chat_log.write(Text("  Ctrl+V            Mock voice input", style="#D4D4D4"))
+
+    async def _handle_slash_command(self, command: str, chat_log: RichLog) -> bool:
+        """Handle slash commands and return True when a command was consumed."""
+        normalized = command.strip().lower()
+
+        if normalized == "/help":
+            self._render_help(chat_log)
+            return True
+
+        if normalized == "/agents":
+            await asyncio.sleep(0.25)
+            chat_log.write(Text("[VOCO] Sub-agent orchestrator online.", style="#C96B45"))
+            chat_log.write(Text("[AGENT-1] Planner ready", style="#D4D4D4"))
+            chat_log.write(Text("[AGENT-2] Coder ready", style="#D4D4D4"))
+            return True
+
+        if normalized == "/security-review":
+            await asyncio.sleep(0.25)
+            chat_log.write(Text("[VOCO] Running security review (mock)...", style="#C96B45"))
+            chat_log.write(Text("No critical findings. 2 low-risk suggestions.", style="#D4D4D4"))
+            return True
+
+        if normalized == "/resume":
+            await asyncio.sleep(0.25)
+            chat_log.write(Text("[VOCO] Restored previous task context.", style="#C96B45"))
+            chat_log.write(Text("Ready for next instruction.", style="#D4D4D4"))
+            return True
+
+        if normalized == "/back":
+            chat_log.write(Text("[VOCO] Already on home dashboard.", style="#C96B45"))
+            return True
+
+        if normalized == "/workspace":
+            await asyncio.sleep(0.15)
+            chat_log.write(Text("[VOCO] Workspace", style="#C96B45"))
+            chat_log.write(Text("  Root   /workspace/voco/apps", style="#D4D4D4"))
+            chat_log.write(Text("  Model  Qwen 2.5 Coder • Local LLM", style="#D4D4D4"))
+            chat_log.write(Text("  Files  12 indexed  •  3 modified", style="#D4D4D4"))
+            return True
+
+        return False
+
+    async def on_input_submitted(self, event: Input.Submitted) -> None:
+        # Frontend-only mock flow:
+        # capture command -> clear input -> swap to chat view -> simulated response.
+        command = event.value.strip()
+        if not command:
+            return
+
+        input_box = self.query_one("#command-input", Input)
+        input_box.value = ""
+
+        chat_log = self._activate_conversation()
+
+        chat_log.write(Text(f"> {command}", style="#D4D4D4"))
+
+        if await self._handle_slash_command(command, chat_log):
+            return
+
+        self._handle_user_input(command)
+
+    def _update_output(self, message: str, style: str) -> None:
+        """Write a formatted status line to the output panel."""
+        chat_log = self._activate_conversation()
+        chat_log.write(Text(message, style=style))
+
+    def _emit_to_ui(self, message: str, level: str = "info") -> None:
+        """
+        Thread-safe callback used by orchestrator.run to stream progress.
+        """
+        color_map = {
+            "info": "white",
+            "step": "cyan",
+            "success": "green",
+            "error": "red",
+        }
+        color = color_map.get(level, "white")
+        safe_message = escape(message).replace("\r", "").strip()
+        self.call_from_thread(self._update_output, safe_message, color)
+
+    def _handle_user_input(self, task: str) -> None:
+        """Run orchestrator task in a background thread to keep the TUI responsive."""
+        if not task.strip():
+            return
+
+        def run_task() -> None:
+            try:
+                orchestrator_run(
+                    task=task,
+                    context=_agent_context,
+                    ui_callback=lambda msg, lvl: self._emit_to_ui(msg, lvl),
+                )
+            except Exception as exc:
+                self._emit_to_ui(f"[VOCO] FATAL ERROR: {exc}", "error")
+
+        thread = threading.Thread(target=run_task, daemon=True)
+        thread.start()
+
+    def action_voice_toggle(self) -> None:
+        # Ctrl+V now works from both dashboard and conversation views.
+        chat_log = self._activate_conversation()
+        chat_log.write(Text("[VOCO VOICE] Listening...", style="#C96B45"))
+
+
+if __name__ == "__main__":
+    VocoApp().run()
+</file>
+
+</files>

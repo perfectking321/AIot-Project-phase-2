@@ -11,6 +11,7 @@ rich>=13.0.0
 
 # ==================== Windows Automation ====================
 pyautogui>=0.9.54
+pyperclip>=1.8.2
 pywinauto>=0.6.8
 Pillow>=10.0.0
 

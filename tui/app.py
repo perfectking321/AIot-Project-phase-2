@@ -85,19 +85,9 @@ class VoxcodeApp(App):
         """Initialize global hotkey listener."""
         try:
             from voice.hotkey import GlobalHotkey
-            import time
-
-            self._last_hotkey_time = 0.0
 
             def on_hotkey_press():
                 """Called when Ctrl+B is pressed globally."""
-                # Extra debounce at TUI level
-                now = time.time()
-                if now - self._last_hotkey_time < 0.5:
-                    logger.warning(f"TUI debounce: ignoring hotkey (too fast)")
-                    return
-                self._last_hotkey_time = now
-
                 logger.info(f"Hotkey pressed! Current state: is_recording={self.is_recording}")
                 # Schedule toggle on main thread
                 self.call_from_thread(self._do_toggle)
@@ -301,18 +291,18 @@ class VoxcodeApp(App):
             self.set_status("Ready")
 
     async def _execute_command(self, command: str) -> None:
-        """Execute command - routes to Browser-Use or Fast Agent based on task type."""
+        """Execute command using the hybrid state-aware architecture.
+
+        Flow:
+        1. Planner Brain: API-aware state hierarchy + subtasks
+        2. Eyes + Hands: perceive and decide action per subtask
+        3. Verifier + reactive correction: validate transition and self-correct
+        """
         self.set_status(f"Analyzing command...")
         self.log_info("")
 
-        # Check if this is a browser task
-        from agent.skills.normal_chrome_agent import NormalChromeAgent
-        from agent.skills.browser_agent import BrowserUseAgent
-
-        if BrowserUseAgent.is_browser_task(command):
-            await self._execute_browser_command(command)
-        else:
-            await self._execute_desktop_command(command)
+        # All commands now use the unified pipeline
+        await self._execute_desktop_command(command)
 
     async def _execute_browser_command(self, command: str) -> None:
         """Execute browser task using normal Chrome browser (no special setup required)."""
@@ -365,56 +355,100 @@ class VoxcodeApp(App):
         self.set_status("Ready")
 
     async def _execute_desktop_command(self, command: str) -> None:
-        """Execute desktop task using Fast Visual Agent (Screenshot + Groq)."""
-        self.set_status(f"Thinking...")
-        self.log_status("Desktop task → Using Fast Visual Agent")
-        self.log_info("[dim]Screenshot → Analyze → Act → Repeat[/]")
-        self.log_info("")
+        """Execute hybrid architecture flow: state-aware plan -> reactive execution."""
+        self.set_status("Planning state hierarchy...")
+        self.log_status("Planning Brain -> API-aware state hierarchy + subtasks")
 
         try:
-            from agent.fast_agent import FastVisualAgent
-            from agent.tools import WindowsTools
+            from brain.planner import get_planner
+            from agent.pipeline import get_pipeline
 
-            # Create tools instance
-            tools = WindowsTools(vision_instance=self.vision)
+            planner = get_planner()
 
-            # Step counter for display
-            self._current_step = 0
+            active_win = ""
+            try:
+                import pygetwindow as gw
+                w = gw.getActiveWindow()
+                if w:
+                    active_win = w.title
+            except Exception:
+                pass
 
-            def on_status(msg: str):
-                self.set_status(msg)
+            self.log_info(f"[dim]Active window: {active_win or 'Unknown'}[/]")
 
-            def on_step(step_num: int, msg: str, status: str):
-                self._current_step = step_num
-                self.log_agent_step(step_num, msg, status)
-
-            # Create Fast Agent (OmniParser + Groq = fast!)
-            agent = FastVisualAgent(
-                vision=self.vision,
-                tools=tools,
-                on_status=on_status,
-                on_step=on_step
+            task_plan = await asyncio.to_thread(
+                planner.create_plan,
+                command,
+                active_win or "No active window detected",
             )
 
-            # Store reference for cleanup on exit
-            self._current_agent = agent
+            self.log_info("\n[bold]State Hierarchy:[/]")
+            self.log_info(f"  [dim]Initial:[/] {task_plan.initial_state or 'Unknown'}")
+            if task_plan.intermediate_states:
+                for i, state in enumerate(task_plan.intermediate_states, 1):
+                    self.log_info(f"  [dim]S{i}:[/] {state}")
+            self.log_info(f"  [dim]Goal:[/] {task_plan.goal_state or task_plan.goal}")
 
-            # Execute
-            result = await asyncio.to_thread(agent.process_command, command)
+            if task_plan.relevant_apis:
+                api_names = ", ".join(api.get("name", api.get("id", "api")) for api in task_plan.relevant_apis)
+                self.log_info(f"  [dim]Relevant APIs:[/] {api_names}")
+
+            self.log_info(f"\n[bold]Subtasks ({len(task_plan.subtasks)}):[/]")
+            for i, subtask in enumerate(task_plan.subtasks, 1):
+                self.log_info(f"  [dim]{i}.[/] {subtask.description}")
+            self.log_info("")
+
+            if not task_plan.subtasks:
+                self.log_warning("Planner returned no subtasks")
+                self.set_status("Ready")
+                return
+
+        except Exception as e:
+            self.log_error(f"Planning failed: {e}")
+            logger.error(f"Planning error: {e}", exc_info=True)
+            self.set_status("Ready")
+            return
+
+        # ── PIPELINE: OmniParser + QWEN + verification with state checks ───────
+        self.set_status("Executing...")
+        self.log_status("Reactive Loop: perceive -> decide -> execute -> verify")
+
+        def on_step(step_num: int, msg: str, status: str):
+            self.log_agent_step(step_num, msg, status)
+
+        def on_status_cb(msg: str):
+            self.set_status(msg)
+
+        try:
+            pipeline = get_pipeline(
+                on_status=on_status_cb,
+                on_step=on_step,
+                use_caption_model=False,  # Faster without Florence-2
+                preload_models=True
+            )
+
+            # Store reference for cleanup
+            self._current_agent = pipeline
+
+            result = await asyncio.to_thread(
+                pipeline.run_task_plan,
+                task_plan,
+                on_status_cb,
+                on_step,
+            )
 
             # Clear agent reference
             self._current_agent = None
 
-            # Show result
             self.log_info("")
-            if "Successfully" in result:
+            if result.startswith("Successfully"):
                 self.log_success(f"✓ {result}")
             else:
                 self.log_warning(f"⚠ {result}")
 
         except Exception as e:
-            self.log_error(f"Execution failed: {e}")
-            logger.error(f"Execution error: {e}", exc_info=True)
+            self.log_error(f"Pipeline error: {e}")
+            logger.error(f"Pipeline error", exc_info=True)
 
         self._current_agent = None
         self.set_status("Ready")

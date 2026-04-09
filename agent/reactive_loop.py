@@ -26,7 +26,7 @@ from agent.tools import WindowsTools, ToolResult, ToolStatus
 from agent.omniparser import OmniParser, ParsedScreen, get_omniparser
 
 
-class ActionResult(Enum):
+class ReactiveActionResult(Enum):
     SUCCESS = "success"
     FAILED = "failed"
     NEEDS_RETRY = "needs_retry"
@@ -35,7 +35,7 @@ class ActionResult(Enum):
 
 
 @dataclass
-class ScreenState:
+class ReactiveScreenState:
     """Captured state of the screen."""
     timestamp: float
     screenshot: Optional[Image.Image] = None
@@ -63,10 +63,10 @@ class ActionAttempt:
     action: str
     tool: str
     params: Dict[str, Any]
-    result: ActionResult
+    result: ReactiveActionResult
     error: str = ""
-    before_state: Optional[ScreenState] = None
-    after_state: Optional[ScreenState] = None
+    before_state: Optional[ReactiveScreenState] = None
+    after_state: Optional[ReactiveScreenState] = None
 
 
 class ReactiveAgent:
@@ -161,9 +161,9 @@ Respond with ONLY JSON:
 
         logger.info("ReactiveAgent initialized")
 
-    def capture_screen_state(self) -> ScreenState:
+    def capture_screen_state(self) -> ReactiveScreenState:
         """Capture the current screen state with app detection."""
-        state = ScreenState(timestamp=time.time())
+        state = ReactiveScreenState(timestamp=time.time())
 
         try:
             # Get screenshot
@@ -248,13 +248,13 @@ Respond with ONLY JSON:
 
         return visible_apps
 
-    def decide_next_action(self, goal: str, state: ScreenState) -> Dict[str, Any]:
+    def decide_next_action(self, goal: str, state: ReactiveScreenState) -> Dict[str, Any]:
         """Use LLM to decide the next action based on current screen state."""
 
         # Format action history
         history_lines = []
         for i, attempt in enumerate(self.action_history[-5:], 1):  # Last 5 actions
-            status = "OK" if attempt.result == ActionResult.SUCCESS else "FAILED"
+            status = "OK" if attempt.result == ReactiveActionResult.SUCCESS else "FAILED"
             history_lines.append(f"{i}. [{status}] {attempt.action}")
 
         history_str = "\n".join(history_lines) if history_lines else "(No actions yet)"
@@ -321,8 +321,8 @@ Respond with ONLY JSON:
     def verify_action_result(
         self,
         action: str,
-        before: ScreenState,
-        after: ScreenState,
+        before: ReactiveScreenState,
+        after: ReactiveScreenState,
         goal: str
     ) -> Dict[str, Any]:
         """Verify if an action succeeded by comparing before/after states."""
@@ -424,7 +424,7 @@ Respond with ONLY JSON:
 
             # Determine action result
             if result.success:
-                action_result = ActionResult.SUCCESS
+                action_result = ReactiveActionResult.SUCCESS
 
                 # Optional: Use LLM to verify
                 if self.verify_actions:
@@ -438,10 +438,10 @@ Respond with ONLY JSON:
                         return f"Completed: {goal}"
 
                     if not verification.get("success", True):
-                        action_result = ActionResult.NEEDS_ALTERNATIVE
+                        action_result = ReactiveActionResult.NEEDS_ALTERNATIVE
                         self.on_message(f"Action may have failed: {verification.get('reason')}")
             else:
-                action_result = ActionResult.FAILED
+                action_result = ReactiveActionResult.FAILED
                 self.on_message(f"Action failed: {result.message}")
 
             # Record attempt
@@ -459,7 +459,7 @@ Respond with ONLY JSON:
             # Check for too many failures
             recent_failures = sum(
                 1 for a in self.action_history[-3:]
-                if a.result in [ActionResult.FAILED, ActionResult.NEEDS_ALTERNATIVE]
+                if a.result in [ReactiveActionResult.FAILED, ReactiveActionResult.NEEDS_ALTERNATIVE]
             )
             if recent_failures >= 3:
                 self.on_message("Too many failures, stopping...")
@@ -468,7 +468,7 @@ Respond with ONLY JSON:
         self.is_running = False
 
         # Summarize
-        successful = sum(1 for a in self.action_history if a.result == ActionResult.SUCCESS)
+        successful = sum(1 for a in self.action_history if a.result == ReactiveActionResult.SUCCESS)
         total = len(self.action_history)
 
         if iteration >= self.max_iterations:
@@ -488,14 +488,14 @@ class ScreenMonitor:
     Runs in background and provides screen state updates.
     """
 
-    def __init__(self, interval: float = 0.5, on_change: Callable[[ScreenState], None] = None):
+    def __init__(self, interval: float = 0.5, on_change: Callable[[ReactiveScreenState], None] = None):
         self.interval = interval
         self.on_change = on_change or (lambda s: None)
         self.parser = get_omniparser()
 
         self._running = False
         self._thread = None
-        self._last_state: Optional[ScreenState] = None
+        self._last_state: Optional[ReactiveScreenState] = None
 
     def start(self):
         """Start continuous monitoring."""
@@ -530,9 +530,9 @@ class ScreenMonitor:
 
             time.sleep(self.interval)
 
-    def _capture_state(self) -> ScreenState:
+    def _capture_state(self) -> ReactiveScreenState:
         """Capture current screen state."""
-        state = ScreenState(timestamp=time.time())
+        state = ReactiveScreenState(timestamp=time.time())
 
         try:
             state.screenshot = pyautogui.screenshot()
@@ -550,7 +550,7 @@ class ScreenMonitor:
 
         return state
 
-    def _has_significant_change(self, new_state: ScreenState) -> bool:
+    def _has_significant_change(self, new_state: ReactiveScreenState) -> bool:
         """Check if screen state changed significantly."""
         if not self._last_state:
             return True
@@ -563,6 +563,6 @@ class ScreenMonitor:
 
         return False
 
-    def get_current_state(self) -> Optional[ScreenState]:
+    def get_current_state(self) -> Optional[ReactiveScreenState]:
         """Get the most recent screen state."""
         return self._last_state

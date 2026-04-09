@@ -46,7 +46,7 @@ except ImportError:
 
 
 @dataclass
-class AgentState:
+class IntelligentAgentState:
     """Current state of the agent."""
     phase: str = "idle"  # idle, perceiving, planning, executing, verifying
     current_goal: str = ""
@@ -98,7 +98,7 @@ class IntelligentAgent:
         self.skills = get_registry() if SKILLS_AVAILABLE else None
 
         # State
-        self.state = AgentState(
+        self.state = IntelligentAgentState(
             max_iterations=max_iterations or config.agent.reactive_max_iterations
         )
         self.is_running = False

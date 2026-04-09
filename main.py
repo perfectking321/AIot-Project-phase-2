@@ -120,7 +120,7 @@ def check_ollama():
                 print("\n[!] Ollama not available. Make sure it's running:")
                 print("    ollama serve")
             else:
-                print(f"\n[!] {provider} not available. Check API key in config.py")
+                print(f"\n[!] {provider} not available. Check GROQ_API_KEY environment variable")
             return False
     except Exception as e:
         logger.error(f"LLM check failed: {e}")
@@ -138,18 +138,22 @@ def run_tui():
 
 
 def run_cli(command: str):
-    """Run a single command in CLI mode."""
+    """Run a single command in CLI mode using stateful planning + pipeline."""
     logger = logging.getLogger("voxcode")
     logger.info(f"CLI mode: {command}")
-
-    from agent.loop import AgentLoop
 
     def on_message(msg):
         print(f"  -> {msg}")
         logger.info(f"Agent: {msg}")
 
-    agent = AgentLoop(on_message=on_message)
-    result = agent.process_command(command)
+    from brain.planner import get_planner
+    from agent.pipeline import get_pipeline
+
+    planner = get_planner()
+    plan = planner.create_plan(command, "CLI mode - no explicit screen context")
+    pipeline = get_pipeline(on_status=on_message)
+
+    result = pipeline.run_task_plan(plan, on_status=on_message)
 
     print(f"\n[OK] Result: {result}")
     logger.info(f"Result: {result}")

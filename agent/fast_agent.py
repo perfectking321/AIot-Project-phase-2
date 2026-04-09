@@ -19,7 +19,7 @@ from config import config
 logger = logging.getLogger("voxcode.fast_agent")
 
 
-class AgentState(Enum):
+class FastAgentState(Enum):
     IDLE = "idle"
     PERCEIVING = "perceiving"
     THINKING = "thinking"
@@ -29,7 +29,7 @@ class AgentState(Enum):
 
 
 @dataclass
-class ScreenState:
+class FastScreenState:
     """Current state of the screen."""
     active_window: str
     window_title: str
@@ -114,7 +114,7 @@ AVAILABLE ACTIONS:
         self.on_status = on_status or (lambda x: None)
         self.on_step = on_step or (lambda n, msg, status: None)
 
-        self.state = AgentState.IDLE
+        self.state = FastAgentState.IDLE
         self.current_goal = ""
         self.history: List[Dict] = []
         self.max_cycles = 12
@@ -127,7 +127,7 @@ AVAILABLE ACTIONS:
         self._stop_requested = True
         logger.info("Agent stop requested")
 
-    def _get_screen_state(self) -> ScreenState:
+    def _get_screen_state(self) -> FastScreenState:
         """Capture and analyze current screen state."""
         import pyautogui
         import pygetwindow as gw
@@ -193,7 +193,7 @@ AVAILABLE ACTIONS:
                 logger.warning(f"Vision error: {e}")
                 screen_description = f"Active window: {window_title} (vision limited)"
 
-        return ScreenState(
+        return FastScreenState(
             active_window=active_window,
             window_title=window_title,
             visible_text=visible_text,
@@ -201,7 +201,7 @@ AVAILABLE ACTIONS:
             screen_description=screen_description
         )
 
-    def _think(self, screen_state: ScreenState) -> Dict[str, Any]:
+    def _think(self, screen_state: FastScreenState) -> Dict[str, Any]:
         """Use Groq to decide next action based on screen state."""
 
         # Build history context
@@ -318,14 +318,14 @@ Respond with JSON only."""
         """Process a command with fast visual feedback."""
         self.current_goal = command
         self.history = []
-        self.state = AgentState.PERCEIVING
+        self.state = FastAgentState.PERCEIVING
         self._stop_requested = False
 
         logger.info(f"Processing: {command}")
         self.on_status(f"Goal: {command}")
 
         cycle = 0
-        while cycle < self.max_cycles and self.state not in [AgentState.COMPLETE, AgentState.FAILED]:
+        while cycle < self.max_cycles and self.state not in [FastAgentState.COMPLETE, FastAgentState.FAILED]:
             if self._stop_requested:
                 logger.info("Stopped by request")
                 return "Stopped by user"
@@ -335,13 +335,13 @@ Respond with JSON only."""
 
             try:
                 # 1. PERCEIVE - Get screen state
-                self.state = AgentState.PERCEIVING
+                self.state = FastAgentState.PERCEIVING
                 self.on_step(cycle, "Analyzing screen...", "running")
                 screen_state = self._get_screen_state()
                 logger.info(f"Screen: {screen_state.screen_description[:80]}...")
 
                 # 2. THINK - Decide action (Groq - fast!)
-                self.state = AgentState.THINKING
+                self.state = FastAgentState.THINKING
                 decision = self._think(screen_state)
 
                 understanding = decision.get("understanding", "")
@@ -353,12 +353,12 @@ Respond with JSON only."""
 
                 # Check if done
                 if goal_achieved or action.get("type") == "done":
-                    self.state = AgentState.COMPLETE
+                    self.state = FastAgentState.COMPLETE
                     self.on_step(cycle, "Goal achieved!", "done")
                     break
 
                 # 3. ACT - Execute
-                self.state = AgentState.ACTING
+                self.state = FastAgentState.ACTING
                 action_desc = f"{action.get('type')}: {action.get('target', action.get('text', action.get('key', '')))}"
                 self.on_step(cycle, action_desc, "running")
 
@@ -385,7 +385,7 @@ Respond with JSON only."""
                 self.on_step(cycle, f"Error: {e}", "failed")
                 time.sleep(0.5)
 
-        if self.state == AgentState.COMPLETE:
+        if self.state == FastAgentState.COMPLETE:
             return f"Successfully completed: {command}"
         else:
             return f"Could not complete: {command}"

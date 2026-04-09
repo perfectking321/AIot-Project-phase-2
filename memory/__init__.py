@@ -6,10 +6,12 @@ Episodic and working memory for context-aware automation.
 from memory.episodic import EpisodicMemory
 from memory.working import WorkingMemory
 from memory.manager import MemoryManager, get_memory
+from memory.persistent import PersistentMemoryVault
 
 __all__ = [
     'EpisodicMemory',
     'WorkingMemory',
+    'PersistentMemoryVault',
     'MemoryManager',
     'get_memory'
 ]

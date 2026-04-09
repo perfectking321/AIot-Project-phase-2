@@ -8,6 +8,7 @@ from typing import Optional, Dict, Any
 
 from memory.episodic import EpisodicMemory, EventType, Episode
 from memory.working import WorkingMemory, AppStatus, AppMemory, CurrentTask
+from memory.persistent import PersistentMemoryVault
 
 logger = logging.getLogger("voxcode.memory")
 
@@ -30,6 +31,7 @@ class MemoryManager:
         """
         self.episodic = EpisodicMemory(persist_path=persist_path)
         self.working = WorkingMemory()
+        self.persistent = PersistentMemoryVault()
 
     # ==================== Goal/Task Management ====================
 
@@ -49,6 +51,11 @@ class MemoryManager:
             EventType.GOAL_STARTED,
             goal,
             data={"subtasks": subtasks}
+        )
+        self.persistent.append_history(
+            event_type=EventType.GOAL_STARTED.value,
+            message=goal,
+            data={"subtasks": subtasks},
         )
 
         # Start in working memory
@@ -77,6 +84,21 @@ class MemoryManager:
                 success=success,
                 related_goal=task.goal
             )
+            self.persistent.append_history(
+                event_type=event_type.value,
+                message=message or f"{'Completed' if success else 'Failed'}: {task.goal}",
+                data={
+                    "goal": task.goal,
+                    "actions_count": len(task.actions_taken),
+                    "last_error": task.last_error,
+                    "success": success,
+                },
+            )
+            if not success and task.last_error:
+                self.persistent.append_failure(
+                    message=task.last_error,
+                    data={"goal": task.goal},
+                )
 
         self.working.end_task()
 
@@ -119,6 +141,16 @@ class MemoryManager:
             success=success,
             related_goal=goal
         )
+        self.persistent.append_history(
+            event_type=event_type.value,
+            message=action,
+            data={"goal": goal, **(data or {})},
+        )
+        if not success:
+            self.persistent.append_failure(
+                message=action,
+                data={"goal": goal, **(data or {})},
+            )
 
     def record_error(self, error: str, data: Dict = None):
         """Record an error."""
@@ -128,6 +160,15 @@ class MemoryManager:
             error,
             data=data or {},
             success=False
+        )
+        self.persistent.append_history(
+            event_type=EventType.ERROR.value,
+            message=error,
+            data=data or {},
+        )
+        self.persistent.append_failure(
+            message=error,
+            data=data or {},
         )
 
     # ==================== App State Management ====================
@@ -144,6 +185,12 @@ class MemoryManager:
             f"Opened {app_name}",
             data={"app": app_name, "details": details}
         )
+        self.persistent.record_app(app_name)
+        self.persistent.append_history(
+            event_type=EventType.APP_OPENED.value,
+            message=f"Opened {app_name}",
+            data={"app": app_name, "details": details},
+        )
 
     def app_closed(self, app_name: str):
         """Record that an app was closed."""
@@ -152,6 +199,11 @@ class MemoryManager:
             EventType.APP_CLOSED,
             f"Closed {app_name}",
             data={"app": app_name}
+        )
+        self.persistent.append_history(
+            event_type=EventType.APP_CLOSED.value,
+            message=f"Closed {app_name}",
+            data={"app": app_name},
         )
 
     def update_app_state(
@@ -183,6 +235,10 @@ class MemoryManager:
         self.episodic.add(
             EventType.SCREEN_CHANGED,
             description
+        )
+        self.persistent.append_history(
+            event_type=EventType.SCREEN_CHANGED.value,
+            message=description,
         )
 
     # ==================== Context Retrieval ====================

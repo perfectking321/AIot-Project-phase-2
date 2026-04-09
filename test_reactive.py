@@ -37,7 +37,7 @@ def test_reactive_agent():
         return
 
     try:
-        from agent.reactive_loop import ReactiveAgent, ScreenState
+        from agent.reactive_loop import ReactiveAgent, ReactiveScreenState
         print("    [OK] ReactiveAgent available")
     except ImportError as e:
         print(f"    [ERROR] ReactiveAgent not available: {e}")

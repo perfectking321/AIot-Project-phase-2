@@ -37,14 +37,13 @@ class VoiceConfig:
 class LLMConfig:
     """LLM/Brain module configuration."""
     # Provider: "ollama" or "groq"
-    provider: str = "groq"  # Switch to "ollama" to use local models
+    provider: str = "ollama"  # Switch to "ollama" to use local models
 
     # Ollama settings (local)
     ollama_host: str = "http://localhost:11434"
     ollama_model: str = "qwen2.5:7b"  # Better instruction following than llama3.2
 
-    # Groq settings (cloud - fast inference)
-    groq_api_key: str = "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"
+    groq_api_key: str = os.environ.get("GROQ_API_KEY", "")
     groq_model: str = "llama-3.3-70b-versatile"  # Best for planning/reasoning
     # Alternative models: "llama-3.1-8b-instant" (faster), "mixtral-8x7b-32768"
 
@@ -111,6 +110,10 @@ class MemoryConfig:
     persist_episodic: bool = True
     persist_path: str = "memory/episodic_history.json"
     max_working_observations: int = 20
+    vault_dir: str = "memory/vault"
+    user_profile_file: str = "memory/vault/USER.yaml"
+    history_file: str = "memory/vault/HISTORY.jsonl"
+    failures_file: str = "memory/vault/failures.jsonl"
 
 
 @dataclass

@@ -51,7 +51,7 @@ def check_dependencies():
     if api_key and api_key != "your-api-key-here":
         print(f"  [OK] Groq API key configured ({api_key[:15]}...)")
     else:
-        print("  [!] Groq API key not configured in config.py")
+        print("  [!] Groq API key not configured (set GROQ_API_KEY)")
 
     print()
 
@@ -161,7 +161,7 @@ def main():
         if not config.llm.groq_api_key or config.llm.groq_api_key == "your-api-key-here":
             print()
             print("ERROR: Groq API key not configured!")
-            print("Edit config.py and set groq_api_key")
+            print("Set GROQ_API_KEY in your environment or .env file")
             sys.exit(1)
 
         success = asyncio.run(test_browser_task())
@@ -179,7 +179,7 @@ def main():
     print(f"  - Task detection: {'OK' if detection_ok else 'ISSUES'}")
     print()
     print("To use browser automation in VOXCODE:")
-    print("  1. Your Groq API key is already configured ✓")
+    print("  1. Set GROQ_API_KEY in env/.env")
     print("  2. Run: playwright install chromium (if not done)")
     print("  3. Start VOXCODE and say 'Go to YouTube and search for music'")
     print("  4. VOXCODE will detect it's a browser task and use Browser-Use!")

@@ -48,7 +48,8 @@ class Conversation:
         if len(self.messages) > self.max_messages:
             system_msgs = [m for m in self.messages if m.role == "system"]
             other_msgs = [m for m in self.messages if m.role != "system"]
-            self.messages = system_msgs + other_msgs[-(self.max_messages - len(system_msgs)):]
+            keep = max(1, self.max_messages - len(system_msgs))
+            self.messages = system_msgs + other_msgs[-keep:]
 
     def to_list(self) -> List[Dict[str, str]]:
         return [{"role": m.role, "content": m.content} for m in self.messages]
@@ -216,6 +217,99 @@ class GroqClient(BaseLLMClient):
         )
         response.raise_for_status()
         return response.json().get("data", [])
+
+    def plan_subgoals(self, command: str, screen_context: str = "") -> List[str]:
+        """
+        One Groq call -> returns list of subgoal strings.
+        Groq's ONLY job in the new architecture. Called once per command.
+
+        The subgoals are atomic UI actions that will be executed by Qwen locally.
+        Each subgoal should be ONE specific action (click, type, navigate, etc).
+
+        Args:
+            command: The user's voice command
+            screen_context: Optional context about current screen state
+
+        Returns:
+            List of subgoal strings, each representing one atomic action
+        """
+        import json as json_module
+        import logging
+
+        logger = logging.getLogger("voxcode.llm")
+
+        # Build the planning prompt - IMPROVED for better actionable subgoals
+        prompt = f"""You are a Windows automation planner. Break down user commands into SPECIFIC, ACTIONABLE steps.
+
+USER COMMAND: {command}
+CURRENT SCREEN: {screen_context if screen_context else "Desktop or unknown application"}
+
+CRITICAL RULES:
+1. To open an application (Chrome, Notepad, etc):
+   - Step 1: "press Windows key to open Start menu"
+   - Step 2: "type [app name]"
+   - Step 3: "press enter to launch"
+
+2. Each subgoal must be ONE of these exact action types:
+   - "press Windows key to open Start menu" - opens Start menu
+   - "press enter" / "press tab" / "press escape" - keyboard keys
+   - "type [exact text]" - types text (be specific!)
+   - "click on [element name]" - clicks visible UI element
+   - "wait for page to load" - waits 2 seconds
+   - "use Ctrl+L to focus address bar" - keyboard shortcuts
+
+3. For browser tasks:
+   - After opening Chrome: "use Ctrl+L to focus address bar"
+   - Then: "type [url]"
+   - Then: "press enter"
+
+4. Be VERY specific - the executor cannot interpret vague instructions
+
+5. Output ONLY a JSON array of strings
+
+EXAMPLE - "open youtube and search for cats":
+["press Windows key to open Start menu", "type chrome", "press enter to launch", "wait for browser to open", "use Ctrl+L to focus address bar", "type youtube.com", "press enter", "wait for page to load", "click on search box", "type cats", "press enter"]
+
+EXAMPLE - "open notepad":
+["press Windows key to open Start menu", "type notepad", "press enter to launch"]
+
+Output your subgoals as a JSON array:"""
+
+        try:
+            response = self.generate(prompt)
+            content = response.content.strip()
+
+            # Try to extract JSON array from response
+            # First, try direct parse
+            try:
+                subgoals = json_module.loads(content)
+                if isinstance(subgoals, list) and all(isinstance(s, str) for s in subgoals):
+                    logger.info(f"Groq planned {len(subgoals)} subgoals")
+                    return subgoals
+            except json_module.JSONDecodeError:
+                pass
+
+            # Try to find JSON array in response
+            start = content.find("[")
+            end = content.rfind("]") + 1
+            if start >= 0 and end > start:
+                try:
+                    subgoals = json_module.loads(content[start:end])
+                    if isinstance(subgoals, list) and all(isinstance(s, str) for s in subgoals):
+                        logger.info(f"Groq planned {len(subgoals)} subgoals (extracted)")
+                        return subgoals
+                except json_module.JSONDecodeError:
+                    pass
+
+            # If parsing failed, log and return fallback
+            logger.warning(f"Could not parse Groq response as subgoals: {content[:200]}")
+
+        except Exception as e:
+            logger.error(f"plan_subgoals failed: {e}")
+
+        # Fallback: treat whole command as one subgoal
+        logger.warning(f"Using fallback: treating command as single subgoal")
+        return [command]
 
 
 class OllamaClient(BaseLLMClient):

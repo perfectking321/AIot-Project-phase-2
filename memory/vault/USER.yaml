@@ -1,0 +1,4 @@
+name: default
+preferences:
+  language: en
+  voice_feedback: false

@@ -68,7 +68,7 @@ class AudioRecorder:
         self.sample_rate = sample_rate or config.voice.sample_rate
         self.channels = channels or config.voice.channels
         self.chunk_size = chunk_size
-        self.device_index = device_index or config.voice.input_device_index
+        self.device_index = device_index if device_index is not None else config.voice.input_device_index
 
         self._audio = pyaudio.PyAudio()
         self._stream: Optional[pyaudio.Stream] = None
