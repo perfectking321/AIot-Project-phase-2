@@ -138,10 +138,11 @@ class IntelligentAgent:
 
             # Get active window
             try:
-                win = pyautogui.getActiveWindow()
-                if win:
-                    screen_state.active_window = win.title
-            except:
+                if gw:
+                    win = gw.getActiveWindow()
+                    if win and hasattr(win, 'title'):
+                        screen_state.active_window = win.title or ""
+            except Exception:
                 pass
 
             # OmniParser element detection

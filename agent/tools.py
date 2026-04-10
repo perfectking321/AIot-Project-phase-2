@@ -8,6 +8,7 @@ import time
 import subprocess
 import logging
 import json
+import re
 from typing import Optional, List, Any, Tuple
 from dataclasses import dataclass
 from enum import Enum
@@ -16,13 +17,17 @@ from datetime import datetime
 
 logger = logging.getLogger("voxcode.tools")
 
+from agent.trace import get_trace_logger
+
 try:
     import pyautogui
+    import pygetwindow as gw
     pyautogui.FAILSAFE = True
-    pyautogui.PAUSE = 0.1
+    pyautogui.PAUSE = 0.0  # We manage delays explicitly (was 0.1)
     PYAUTOGUI_AVAILABLE = True
 except ImportError:
     PYAUTOGUI_AVAILABLE = False
+    gw = None
 
 from config import config
 
@@ -162,6 +167,7 @@ class WindowsTools:
         self._safe_mode = config.agent.safe_mode
         self._screenshot_dir = "screenshots"
         self._audit_path = Path("audit_log.jsonl")
+        self._trace = get_trace_logger()
         # Use provided vision instance, or fall back to global one
         self._vision = vision_instance if vision_instance else (vision if VISION_AVAILABLE else None)
 
@@ -169,6 +175,8 @@ class WindowsTools:
         self._omniparser = None
         self._use_omniparser = use_omniparser and OMNIPARSER_AVAILABLE
         self._last_parsed_screen = None  # Cache for performance
+        self._last_parsed_screen_time: float = 0.0
+        self._parsed_screen_ttl: float = 0.3
 
         # LLM for semantic matching
         self._llm = None
@@ -185,6 +193,15 @@ class WindowsTools:
         if self._omniparser is None and self._use_omniparser:
             self._omniparser = get_omniparser(preload=False)
         return self._omniparser
+
+    def _get_cached_parsed_screen(self, force: bool = False):
+        if (
+            not force
+            and self._last_parsed_screen is not None
+            and (time.time() - self._last_parsed_screen_time) < self._parsed_screen_ttl
+        ):
+            return self._last_parsed_screen
+        return None
 
     def _get_llm(self):
         """Get or initialize LLM client for semantic matching."""
@@ -204,6 +221,12 @@ class WindowsTools:
             self._audit_path.parent.mkdir(parents=True, exist_ok=True)
             with open(self._audit_path, "a", encoding="utf-8") as handle:
                 handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+            self._trace.log_event(
+                source="windows_tools",
+                event_type=event_type,
+                payload=payload,
+            )
         except Exception as e:
             logger.warning(f"Audit event write failed: {e}")
 
@@ -223,13 +246,38 @@ class WindowsTools:
                 return None
 
             normalized = query.lower().strip()
+            tokens = set(re.findall(r"[a-z0-9]+", normalized))
             for item in matches:
                 name = str(item.get("name", "")).lower()
                 api_id = str(item.get("id", "")).lower()
                 if normalized == name or normalized == api_id:
                     return item
 
-            return matches[0]
+            # Prefer the highest lexical overlap instead of first registry hit.
+            best_item: Optional[dict] = None
+            best_score = 0
+            for item in matches:
+                score = 0
+                name = str(item.get("name", "")).lower()
+                api_id = str(item.get("id", "")).lower()
+                keywords = [str(k).lower() for k in item.get("keywords", [])]
+
+                if name and name in normalized:
+                    score += 8
+                if api_id and api_id in normalized:
+                    score += 6
+
+                for keyword in keywords:
+                    if keyword in normalized:
+                        score += 3
+                    if keyword in tokens:
+                        score += 2
+
+                if score > best_score:
+                    best_score = score
+                    best_item = item
+
+            return best_item if best_score > 0 else None
         except Exception as e:
             logger.warning(f"Registry app resolution failed: {e}")
             return None
@@ -295,30 +343,50 @@ If no good match exists, respond: {{"match": false, "reason": "why"}}"""
 
         return None
 
-    def parse_screen(self) -> ToolResult:
+    def parse_screen(self, force: bool = False) -> ToolResult:
         """Parse the screen and return all detected UI elements."""
         if not self._use_omniparser:
             return ToolResult(ToolStatus.FAILURE, "OmniParser not available")
 
         try:
-            parser = self._get_omniparser()
-            self._last_parsed_screen = parser.parse_screen()
+            from_cache = False
+            parsed = self._get_cached_parsed_screen(force=force)
+            if parsed is None:
+                parser = self._get_omniparser()
+                parsed = parser.parse_screen()
+                self._last_parsed_screen = parsed
+                self._last_parsed_screen_time = time.time()
+            else:
+                self._last_parsed_screen = parsed
+                from_cache = True
 
             # Format for LLM
-            prompt_text = self._last_parsed_screen.to_prompt_format()
-            elements_json = self._last_parsed_screen.to_json()
+            prompt_text = parsed.to_prompt_format()
+            elements_json = parsed.to_json()
 
-            return ToolResult(
+            result = ToolResult(
                 ToolStatus.SUCCESS,
-                f"Found {len(self._last_parsed_screen.elements)} UI elements",
+                f"Found {len(parsed.elements)} UI elements",
                 data={
                     "prompt": prompt_text,
                     "elements": elements_json,
-                    "count": len(self._last_parsed_screen.elements)
+                    "count": len(parsed.elements)
                 }
             )
+            self._audit_event(
+                "parse_screen_succeeded",
+                {
+                    "element_count": len(parsed.elements),
+                    "screenshot_path": parsed.screenshot_path,
+                    "labeled_image_path": parsed.labeled_image_path,
+                    "parse_time": round(float(parsed.parse_time), 4),
+                    "cached": from_cache,
+                },
+            )
+            return result
         except Exception as e:
             logger.error(f"Screen parsing failed: {e}")
+            self._audit_event("parse_screen_failed", {"error": str(e)})
             return ToolResult(ToolStatus.FAILURE, str(e))
 
     def click_element_by_id(self, element_id: int) -> ToolResult:
@@ -379,9 +447,11 @@ If no good match exists, respond: {{"match": false, "reason": "why"}}"""
         # Try OmniParser first (more intelligent)
         if self._use_omniparser:
             try:
-                parser = self._get_omniparser()
-                parsed = parser.parse_screen()
-                self._last_parsed_screen = parsed
+                parse_result = self.parse_screen(force=False)
+                if not parse_result.success or not self._last_parsed_screen:
+                    return parse_result
+
+                parsed = self._last_parsed_screen
 
                 # First try exact/fuzzy string matching
                 matches = parsed.find_by_label(text)
@@ -559,18 +629,91 @@ If no good match exists, respond: {{"match": false, "reason": "why"}}"""
         if not PYAUTOGUI_AVAILABLE:
             return ToolResult(ToolStatus.FAILURE, "pyautogui not available")
         try:
-            win = pyautogui.getActiveWindow()
-            if win:
+            win = gw.getActiveWindow()
+            if win and hasattr(win, 'title'):
                 return ToolResult(ToolStatus.SUCCESS, f"Active window: {win.title}", data={"title": win.title})
             return ToolResult(ToolStatus.FAILURE, "No active window")
         except Exception as e:
             return ToolResult(ToolStatus.FAILURE, str(e))
 
+    def get_running_apps(self) -> ToolResult:
+        """List visible top-level window titles."""
+        if not PYAUTOGUI_AVAILABLE:
+            return ToolResult(ToolStatus.FAILURE, "pyautogui not available")
+        try:
+            titles = [
+                title.strip()
+                for title in gw.getAllTitles()
+                if title and title.strip()
+            ]
+            unique_titles = list(dict.fromkeys(titles))
+            if not unique_titles:
+                return ToolResult(ToolStatus.FAILURE, "No visible apps found")
+
+            preview = ", ".join(unique_titles[:8])
+            return ToolResult(
+                ToolStatus.SUCCESS,
+                f"Visible apps ({len(unique_titles)}): {preview}",
+                data={"titles": unique_titles, "count": len(unique_titles)},
+            )
+        except Exception as e:
+            return ToolResult(ToolStatus.FAILURE, str(e))
+
+    def _wait_for_window_change(self, original_title: str, timeout: float = 3.0) -> bool:
+        """Poll until active window title changes or timeout."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            time.sleep(0.15)
+            try:
+                win = gw.getActiveWindow()
+                if win and hasattr(win, "title"):
+                    title = win.title or ""
+                    if title and title != original_title:
+                        return True
+            except Exception:
+                pass
+        return False
+
     def open_application(self, path_or_name: str) -> ToolResult:
         """Open an application by name or path. Supports Windows Search for unknown apps."""
         app_name = path_or_name.lower().strip()
         logger.info(f"Opening application: {app_name}")
-        self._audit_event("open_application_started", {"query": path_or_name, "normalized_query": app_name})
+
+        before_window_result = self.get_active_window()
+        before_window = (
+            before_window_result.data.get("title")
+            if before_window_result.success and before_window_result.data
+            else "Unknown"
+        )
+        before_screenshot = self._trace.capture_screenshot(
+            source="windows_tools",
+            tag=f"open_app_before_{app_name}",
+            extra_payload={"query": path_or_name},
+        )
+
+        self._audit_event(
+            "open_application_started",
+            {
+                "query": path_or_name,
+                "normalized_query": app_name,
+                "before_window": before_window,
+                "before_screenshot": before_screenshot,
+            },
+        )
+
+        if re.search(r"\b(close|exit|quit|minimi[sz]e|stop)\b", app_name):
+            message = f"Rejected open request because intent looks like close/exit: {path_or_name}"
+            self._audit_event(
+                "open_application_rejected",
+                {
+                    "query": path_or_name,
+                    "normalized_query": app_name,
+                    "reason": "close_intent_detected",
+                    "before_window": before_window,
+                    "before_screenshot": before_screenshot,
+                },
+            )
+            return ToolResult(ToolStatus.FAILURE, message)
 
         try:
             # Check known apps first
@@ -578,11 +721,28 @@ If no good match exists, respond: {{"match": false, "reason": "why"}}"""
                 cmd = APP_COMMANDS[app_name]
                 logger.info(f"Using command: {cmd}")
                 subprocess.Popen(cmd, shell=True)
-                time.sleep(2.0)
+                self._wait_for_window_change(before_window, timeout=3.0)
+
+                after_window_result = self.get_active_window()
+                after_window = (
+                    after_window_result.data.get("title")
+                    if after_window_result.success and after_window_result.data
+                    else "Unknown"
+                )
+                after_screenshot = self._trace.capture_screenshot(
+                    source="windows_tools",
+                    tag=f"open_app_after_{app_name}",
+                    extra_payload={"query": path_or_name, "method": "app_commands"},
+                )
+
                 self._audit_event("open_application_succeeded", {
                     "query": path_or_name,
                     "method": "app_commands",
                     "command": cmd,
+                    "before_window": before_window,
+                    "after_window": after_window,
+                    "before_screenshot": before_screenshot,
+                    "after_screenshot": after_screenshot,
                 })
                 return ToolResult(ToolStatus.SUCCESS, f"Opened: {path_or_name}")
 
@@ -594,7 +754,20 @@ If no good match exists, respond: {{"match": false, "reason": "why"}}"""
                     launch_cmd = f"start {exe_name}" if ":" in exe_name else f'start "" "{exe_name}"'
                     logger.info(f"Using registry launch command: {launch_cmd}")
                     subprocess.Popen(launch_cmd, shell=True)
-                    time.sleep(2.0)
+                    self._wait_for_window_change(before_window, timeout=3.0)
+
+                    after_window_result = self.get_active_window()
+                    after_window = (
+                        after_window_result.data.get("title")
+                        if after_window_result.success and after_window_result.data
+                        else "Unknown"
+                    )
+                    after_screenshot = self._trace.capture_screenshot(
+                        source="windows_tools",
+                        tag=f"open_app_after_{app_name}",
+                        extra_payload={"query": path_or_name, "method": "api_registry"},
+                    )
+
                     self._audit_event("open_application_succeeded", {
                         "query": path_or_name,
                         "method": "api_registry",
@@ -602,6 +775,10 @@ If no good match exists, respond: {{"match": false, "reason": "why"}}"""
                         "api_name": registry_match.get("name"),
                         "exe_name": exe_name,
                         "command": launch_cmd,
+                        "before_window": before_window,
+                        "after_window": after_window,
+                        "before_screenshot": before_screenshot,
+                        "after_screenshot": after_screenshot,
                     })
                     return ToolResult(ToolStatus.SUCCESS, f"Opened via registry: {path_or_name}")
 
@@ -609,11 +786,28 @@ If no good match exists, respond: {{"match": false, "reason": "why"}}"""
             if os.path.exists(path_or_name):
                 logger.info(f"Opening file path: {path_or_name}")
                 os.startfile(path_or_name)
-                time.sleep(2.0)
+                self._wait_for_window_change(before_window, timeout=3.0)
+
+                after_window_result = self.get_active_window()
+                after_window = (
+                    after_window_result.data.get("title")
+                    if after_window_result.success and after_window_result.data
+                    else "Unknown"
+                )
+                after_screenshot = self._trace.capture_screenshot(
+                    source="windows_tools",
+                    tag=f"open_app_after_{app_name}",
+                    extra_payload={"query": path_or_name, "method": "path"},
+                )
+
                 self._audit_event("open_application_succeeded", {
                     "query": path_or_name,
                     "method": "path",
                     "path": path_or_name,
+                    "before_window": before_window,
+                    "after_window": after_window,
+                    "before_screenshot": before_screenshot,
+                    "after_screenshot": after_screenshot,
                 })
                 return ToolResult(ToolStatus.SUCCESS, f"Opened: {path_or_name}")
 
@@ -624,18 +818,43 @@ If no good match exists, respond: {{"match": false, "reason": "why"}}"""
             pyautogui.write(app_name, interval=0.02)
             time.sleep(1.0)
             pyautogui.press('enter')
-            time.sleep(2.0)
+            self._wait_for_window_change(before_window, timeout=3.0)
+
+            after_window_result = self.get_active_window()
+            after_window = (
+                after_window_result.data.get("title")
+                if after_window_result.success and after_window_result.data
+                else "Unknown"
+            )
+            after_screenshot = self._trace.capture_screenshot(
+                source="windows_tools",
+                tag=f"open_app_after_{app_name}",
+                extra_payload={"query": path_or_name, "method": "windows_search"},
+            )
+
             self._audit_event("open_application_succeeded", {
                 "query": path_or_name,
                 "method": "windows_search",
+                "before_window": before_window,
+                "after_window": after_window,
+                "before_screenshot": before_screenshot,
+                "after_screenshot": after_screenshot,
             })
             return ToolResult(ToolStatus.SUCCESS, f"Searched and opened: {path_or_name}")
 
         except Exception as e:
             logger.error(f"Failed to open {path_or_name}: {e}")
+            failure_screenshot = self._trace.capture_screenshot(
+                source="windows_tools",
+                tag=f"open_app_failed_{app_name}",
+                extra_payload={"query": path_or_name},
+            )
             self._audit_event("open_application_failed", {
                 "query": path_or_name,
                 "error": str(e),
+                "before_window": before_window,
+                "before_screenshot": before_screenshot,
+                "failure_screenshot": failure_screenshot,
             })
             return ToolResult(ToolStatus.FAILURE, f"Failed to open {path_or_name}: {e}")
 
@@ -644,7 +863,7 @@ If no good match exists, respond: {{"match": false, "reason": "why"}}"""
         if not PYAUTOGUI_AVAILABLE:
             return ToolResult(ToolStatus.FAILURE, "pyautogui not available")
         try:
-            windows = pyautogui.getWindowsWithTitle(title)
+            windows = gw.getWindowsWithTitle(title)
             if windows:
                 win = windows[0]
                 try:
@@ -664,6 +883,114 @@ If no good match exists, respond: {{"match": false, "reason": "why"}}"""
         """Close the current window using Alt+F4."""
         return self.hotkey("alt", "f4")
 
+    def control_system_setting(self, command: str) -> ToolResult:
+        """Apply common local system controls (volume/brightness)."""
+        if not command:
+            return ToolResult(ToolStatus.FAILURE, "No system control command provided")
+
+        cmd = command.strip().lower()
+        logger.info(f"System control command: {cmd}")
+
+        try:
+            if "brightness" in cmd:
+                # Handle max/min/full keywords FIRST
+                if any(token in cmd for token in ["max", "maximum", "full", "highest"]):
+                    ps_cmd = (
+                        "(Get-WmiObject -Namespace root/WMI -Class WmiMonitorBrightnessMethods)"
+                        ".WmiSetBrightness(1,100)"
+                    )
+                    subprocess.run(
+                        ["powershell", "-NoProfile", "-Command", ps_cmd],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                    )
+                    return ToolResult(ToolStatus.SUCCESS, "Brightness set to 100% (max)")
+
+                if any(token in cmd for token in ["min", "minimum", "lowest", "zero"]):
+                    ps_cmd = (
+                        "(Get-WmiObject -Namespace root/WMI -Class WmiMonitorBrightnessMethods)"
+                        ".WmiSetBrightness(1,0)"
+                    )
+                    subprocess.run(
+                        ["powershell", "-NoProfile", "-Command", ps_cmd],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                    )
+                    return ToolResult(ToolStatus.SUCCESS, "Brightness set to 0% (min)")
+
+                # Numeric level (e.g., "brightness 50")
+                level_match = re.search(r"(\d{1,3})", cmd)
+                if level_match:
+                    level = max(0, min(100, int(level_match.group(1))))
+                    ps_cmd = (
+                        "(Get-WmiObject -Namespace root/WMI -Class WmiMonitorBrightnessMethods)"
+                        f".WmiSetBrightness(1,{level})"
+                    )
+                    subprocess.run(
+                        ["powershell", "-NoProfile", "-Command", ps_cmd],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                    )
+                    return ToolResult(ToolStatus.SUCCESS, f"Set brightness to {level}%")
+
+                # Relative +/- 10 steps
+                delta = 10
+                if any(token in cmd for token in ["decrease", "lower", "down", "dim"]):
+                    sign = -1
+                else:
+                    sign = 1
+
+                ps_cmd = (
+                    "$b=(Get-WmiObject -Namespace root/WMI -Class WmiMonitorBrightness).CurrentBrightness;"
+                    f"$n=[Math]::Max(0,[Math]::Min(100,$b+({sign * delta})));"
+                    "(Get-WmiObject -Namespace root/WMI -Class WmiMonitorBrightnessMethods).WmiSetBrightness(1,$n)"
+                )
+                subprocess.run(
+                    ["powershell", "-NoProfile", "-Command", ps_cmd],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                direction = "increased" if sign > 0 else "decreased"
+                return ToolResult(ToolStatus.SUCCESS, f"Brightness {direction}")
+
+            if any(token in cmd for token in ["mute", "unmute", "volume", "sound"]):
+                if not PYAUTOGUI_AVAILABLE:
+                    return ToolResult(ToolStatus.FAILURE, "pyautogui not available for volume controls")
+
+                if "mute" in cmd and "unmute" not in cmd:
+                    pyautogui.press("volumemute")
+                    return ToolResult(ToolStatus.SUCCESS, "Toggled mute")
+
+                if "unmute" in cmd:
+                    pyautogui.press("volumemute")
+                    return ToolResult(ToolStatus.SUCCESS, "Toggled unmute intent")
+
+                steps_match = re.search(r"(\d{1,2})", cmd)
+                steps = int(steps_match.group(1)) if steps_match else 5
+                steps = max(1, min(20, steps))
+
+                if any(token in cmd for token in ["increase", "up", "raise", "louder"]):
+                    key = "volumeup"
+                    direction = "increased"
+                elif any(token in cmd for token in ["decrease", "down", "lower", "quieter"]):
+                    key = "volumedown"
+                    direction = "decreased"
+                else:
+                    return ToolResult(ToolStatus.FAILURE, f"Unrecognized volume intent: {command}")
+
+                for _ in range(steps):
+                    pyautogui.press(key)
+                return ToolResult(ToolStatus.SUCCESS, f"Volume {direction} ({steps} steps)")
+
+            return ToolResult(ToolStatus.FAILURE, f"Unsupported system control command: {command}")
+        except Exception as e:
+            logger.error(f"System control failed: {e}")
+            return ToolResult(ToolStatus.FAILURE, str(e))
+
     # ==================== VISION ACTIONS ====================
 
     def take_screenshot(self, filename: str = None) -> ToolResult:
@@ -678,6 +1005,12 @@ If no good match exists, respond: {{"match": false, "reason": "why"}}"""
             screenshot = pyautogui.screenshot()
             screenshot.save(filepath)
             logger.info(f"Screenshot saved: {filepath}")
+            self._audit_event(
+                "manual_screenshot_saved",
+                {
+                    "path": filepath,
+                },
+            )
             return ToolResult(ToolStatus.SUCCESS, f"Screenshot saved: {filepath}", screenshot=filepath)
         except Exception as e:
             return ToolResult(ToolStatus.FAILURE, str(e))

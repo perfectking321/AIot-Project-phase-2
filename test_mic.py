@@ -11,8 +11,11 @@ import numpy as np
 try:
     import pyaudio
 except ImportError:
-    print("ERROR: pyaudio not installed. Run: pip install pyaudio")
-    sys.exit(1)
+    try:
+        import pyaudiowpatch as pyaudio
+    except ImportError:
+        print("ERROR: audio backend not installed. Run: pip install pyaudiowpatch (Windows) or pip install pyaudio")
+        sys.exit(1)
 
 
 def list_devices():

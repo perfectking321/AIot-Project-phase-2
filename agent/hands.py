@@ -8,9 +8,14 @@ Falls back to Groq if Ollama is not available.
 """
 import json
 import logging
+import re
 import time
 import requests
 from typing import Optional, Dict, Any, List
+from dataclasses import dataclass, field
+
+from config import config
+from agent.trace import get_trace_logger
 
 logger = logging.getLogger("voxcode.hands")
 
@@ -20,7 +25,7 @@ logger = logging.getLogger("voxcode.hands")
 #   - qwen2.5:7b (recommended - balanced)
 #   - qwen2.5:3b (faster, less accurate)
 #   - qwen2.5:14b (slower, more accurate)
-QWEN_MODEL = "qwen2.5:7b"  # Changed to match installed model
+QWEN_MODEL = getattr(config.llm, "executor_model", config.llm.ollama_model)
 OLLAMA_HOST = "http://localhost:11434"
 
 # System prompt for action decisions - REACTIVE and CONTEXT-AWARE
@@ -67,6 +72,14 @@ DECISION RULES:
 Output ONLY the JSON action, nothing else."""
 
 
+@dataclass
+class SubgoalTracker:
+    """Tracks subgoal execution state for context-aware local action selection."""
+    completed: List[str] = field(default_factory=list)
+    failed: List[str] = field(default_factory=list)
+    current: str = ""
+
+
 class Hands:
     """
     Qwen 7B INT4 local inference for action decisions.
@@ -101,19 +114,18 @@ class Hands:
         self.model = model
         self.host = host.rstrip("/")
         self.timeout = timeout
-        self.use_groq_fallback = use_groq_fallback
+        self.use_groq_fallback = False
         self._available_models: Optional[list] = None
         self._use_groq: bool = False
         self._groq_client = None
+        self._trace = get_trace_logger()
+
+        if use_groq_fallback:
+            logger.info("Groq fallback ignored: Ollama-only mode is enforced")
 
         # Verify model is available
         if not self._verify_model():
-            if use_groq_fallback:
-                logger.info("Falling back to Groq for action decisions")
-                self._use_groq = True
-                self._init_groq()
-            else:
-                logger.error("Ollama not available and Groq fallback disabled")
+            logger.error("Ollama model unavailable for Hands executor")
 
     def _verify_model(self) -> bool:
         """Check if model is available. Log warning if not."""
@@ -175,6 +187,15 @@ class Hands:
     def _decide_via_groq(self, subgoal: str, elements_str: str, expected_state: str = "") -> Dict[str, Any]:
         """Use Groq API for action decision (fallback when Ollama unavailable)."""
         if self._groq_client is None:
+            self._trace.log_event(
+                source="hands",
+                event_type="decision_fallback_wait",
+                payload={
+                    "provider": "groq",
+                    "reason": "groq_client_unavailable",
+                    "subgoal": subgoal,
+                },
+            )
             return {"action": "wait", "seconds": 1}
 
         prompt = f"""TASK: {subgoal}
@@ -196,12 +217,55 @@ Output ONE action JSON. ONLY JSON, no explanation:"""
             action = self._parse_action_json(response_text)
             if action:
                 logger.info(f"Groq decision ({elapsed:.0f}ms): {action}")
+                self._trace.log_event(
+                    source="hands",
+                    event_type="decision_received",
+                    payload={
+                        "provider": "groq",
+                        "model": "groq",
+                        "subgoal": subgoal,
+                        "expected_state": expected_state,
+                        "latency_ms": round(elapsed, 2),
+                        "raw_response": response_text,
+                        "decision": action,
+                    },
+                )
                 return action
 
         except Exception as e:
             logger.error(f"Groq inference error: {e}")
+            self._trace.log_exception(
+                source="hands",
+                event_type="decision_error",
+                exc=e,
+                payload={
+                    "provider": "groq",
+                    "subgoal": subgoal,
+                    "expected_state": expected_state,
+                },
+            )
 
+        self._trace.log_event(
+            source="hands",
+            event_type="decision_fallback_wait",
+            payload={
+                "provider": "groq",
+                "reason": "parse_or_inference_failed",
+                "subgoal": subgoal,
+            },
+        )
         return {"action": "wait", "seconds": 1}
+
+    def _elements_preview(self, elements_str: str) -> str:
+        """Truncate element text to a manageable debug preview."""
+        lines = [line for line in elements_str.splitlines() if line.strip()]
+        limit = max(1, int(getattr(config.agent, "trace_element_preview_limit", 25)))
+        if len(lines) <= limit:
+            return "\n".join(lines)
+
+        preview = lines[:limit]
+        preview.append(f"... <{len(lines) - limit} more elements>")
+        return "\n".join(preview)
 
     def _preprocess_subgoal(self, subgoal: str) -> Optional[Dict[str, Any]]:
         """
@@ -239,6 +303,15 @@ Output ONE action JSON. ONLY JSON, no explanation:"""
         # Handle "type [text]" - extract the text
         if subgoal_lower.startswith("type "):
             text = subgoal[5:].strip()
+
+            # Prefer quoted literal text when present, e.g. Type 'Hello World' into Notepad.
+            quoted_match = re.search(r"['\"]([^'\"]+)['\"]", text)
+            if quoted_match:
+                text = quoted_match.group(1).strip()
+
+            # Drop target context, e.g. "into Notepad" / "in search box".
+            text = re.split(r"\s+(?:into|in|on|to)\s+", text, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+
             # Remove quotes if present
             if (text.startswith('"') and text.endswith('"')) or \
                (text.startswith("'") and text.endswith("'")):
@@ -257,7 +330,23 @@ Output ONE action JSON. ONLY JSON, no explanation:"""
         # Not a simple pattern - needs LLM
         return None
 
-    def decide(self, subgoal: str, elements_str: str, expected_state: str = "") -> Dict[str, Any]:
+    def _tracker_lines(self, tracker: Optional[SubgoalTracker]) -> str:
+        """Render tracker context for executor prompts."""
+        if tracker is None:
+            return "Completed subgoals: []\nFailed attempts: []\nCurrent subgoal: "
+        return (
+            f"Completed subgoals: {tracker.completed}\n"
+            f"Failed attempts: {tracker.failed}\n"
+            f"Current subgoal: {tracker.current}"
+        )
+
+    def decide(
+        self,
+        subgoal: str,
+        elements_str: str,
+        expected_state: str = "",
+        tracker: Optional[SubgoalTracker] = None,
+    ) -> Dict[str, Any]:
         """
         Given subgoal + screen elements string, return action dict.
         First tries pattern matching, then uses Ollama/Groq for complex decisions.
@@ -274,14 +363,37 @@ Output ONE action JSON. ONLY JSON, no explanation:"""
         direct_action = self._preprocess_subgoal(subgoal)
         if direct_action is not None:
             logger.info(f"Direct action (pattern match): {direct_action}")
+            self._trace.log_event(
+                source="hands",
+                event_type="decision_direct",
+                payload={
+                    "subgoal": subgoal,
+                    "expected_state": expected_state,
+                    "decision": direct_action,
+                },
+            )
             return direct_action
 
-        # Use Groq fallback if Ollama unavailable
-        if self._use_groq:
-            return self._decide_via_groq(subgoal, elements_str, expected_state=expected_state)
+        self._trace.log_event(
+            source="hands",
+            event_type="decision_requested",
+            payload={
+                "provider": "ollama",
+                "model": self.model,
+                "subgoal": subgoal,
+                "expected_state": expected_state,
+                "tracker": {
+                    "completed": tracker.completed if tracker else [],
+                    "failed": tracker.failed if tracker else [],
+                    "current": tracker.current if tracker else "",
+                },
+                "elements_preview": self._elements_preview(elements_str),
+            },
+        )
 
         prompt = f"""TASK: {subgoal}
 EXPECTED STATE: {expected_state or "Not specified"}
+{self._tracker_lines(tracker)}
 
 SCREEN ELEMENTS:
 {elements_str}
@@ -319,18 +431,72 @@ Output ONE action JSON:"""
 
             if action:
                 logger.info(f"Qwen decision ({elapsed:.0f}ms): {action}")
+                self._trace.log_event(
+                    source="hands",
+                    event_type="decision_received",
+                    payload={
+                        "provider": "ollama",
+                        "model": self.model,
+                        "subgoal": subgoal,
+                        "expected_state": expected_state,
+                        "latency_ms": round(elapsed, 2),
+                        "raw_response": response_text,
+                        "decision": action,
+                    },
+                )
                 return action
 
         except requests.exceptions.Timeout:
             logger.warning(f"Qwen timeout after {self.timeout}s")
+            self._trace.log_event(
+                source="hands",
+                event_type="decision_timeout",
+                payload={
+                    "provider": "ollama",
+                    "model": self.model,
+                    "timeout_seconds": self.timeout,
+                    "subgoal": subgoal,
+                },
+            )
         except requests.exceptions.ConnectionError:
             logger.error("Qwen: Ollama connection failed")
+            self._trace.log_event(
+                source="hands",
+                event_type="decision_connection_error",
+                payload={
+                    "provider": "ollama",
+                    "model": self.model,
+                    "subgoal": subgoal,
+                    "host": self.host,
+                },
+            )
         except json.JSONDecodeError as e:
             logger.warning(f"Qwen JSON parse error: {e}")
+            self._trace.log_exception(
+                source="hands",
+                event_type="decision_json_error",
+                exc=e,
+                payload={"subgoal": subgoal, "model": self.model},
+            )
         except Exception as e:
             logger.error(f"Qwen inference error: {e}")
+            self._trace.log_exception(
+                source="hands",
+                event_type="decision_error",
+                exc=e,
+                payload={"subgoal": subgoal, "model": self.model},
+            )
 
         # Fallback: wait action
+        self._trace.log_event(
+            source="hands",
+            event_type="decision_fallback_wait",
+            payload={
+                "provider": "ollama",
+                "model": self.model,
+                "subgoal": subgoal,
+            },
+        )
         return {"action": "wait", "seconds": 1}
 
     def _elements_to_text(self, actual_elements: Any) -> str:
@@ -458,6 +624,28 @@ Return ONE corrective action JSON only."""
         logger.warning(f"Could not parse action from: {text[:100]}")
         return None
 
+    @staticmethod
+    def _extract_click_coordinates(decision: Dict[str, Any]) -> Optional[tuple[int, int]]:
+        """Extract click coordinates from explicit fields or target text."""
+        x = decision.get("x")
+        y = decision.get("y")
+        if isinstance(x, (int, float)) and isinstance(y, (int, float)):
+            return int(x), int(y)
+
+        target = decision.get("target")
+        if not isinstance(target, str):
+            return None
+
+        tuple_match = re.search(r"\(\s*(\d{1,5})\s*,\s*(\d{1,5})\s*\)", target)
+        if tuple_match:
+            return int(tuple_match.group(1)), int(tuple_match.group(2))
+
+        xy_match = re.search(r"\bx\s*[:=]\s*(\d{1,5}).*?\by\s*[:=]\s*(\d{1,5})", target, flags=re.IGNORECASE)
+        if xy_match:
+            return int(xy_match.group(1)), int(xy_match.group(2))
+
+        return None
+
     def execute(self, decision: Dict[str, Any]) -> bool:
         """
         Execute pyautogui action from decision dict.
@@ -475,13 +663,24 @@ Return ONE corrective action JSON only."""
 
         try:
             if action == "click":
-                x, y = decision.get("x", 0), decision.get("y", 0)
-                if x > 0 and y > 0:
+                coords = self._extract_click_coordinates(decision)
+                if coords:
+                    x, y = coords
                     pyautogui.click(x, y)
                     logger.info(f"Executed: click at ({x}, {y})")
+                    self._trace.log_event(
+                        source="hands",
+                        event_type="action_executed",
+                        payload={"action": action, "decision": decision, "success": True},
+                    )
                     return True
                 else:
-                    logger.warning(f"Invalid click coordinates: ({x}, {y})")
+                    logger.warning(f"Invalid click coordinates in decision: {decision}")
+                    self._trace.log_event(
+                        source="hands",
+                        event_type="action_executed",
+                        payload={"action": action, "decision": decision, "success": False, "reason": "invalid_coordinates"},
+                    )
                     return False
 
             elif action == "type":
@@ -490,7 +689,17 @@ Return ONE corrective action JSON only."""
                     # Use typewrite for ASCII, write for unicode
                     pyautogui.write(text, interval=0.02)
                     logger.info(f"Executed: type '{text[:30]}...'")
+                    self._trace.log_event(
+                        source="hands",
+                        event_type="action_executed",
+                        payload={"action": action, "decision": decision, "success": True},
+                    )
                     return True
+                self._trace.log_event(
+                    source="hands",
+                    event_type="action_executed",
+                    payload={"action": action, "decision": decision, "success": False, "reason": "missing_text"},
+                )
                 return False
 
             elif action == "press":
@@ -498,7 +707,17 @@ Return ONE corrective action JSON only."""
                 if key:
                     pyautogui.press(key)
                     logger.info(f"Executed: press '{key}'")
+                    self._trace.log_event(
+                        source="hands",
+                        event_type="action_executed",
+                        payload={"action": action, "decision": decision, "success": True},
+                    )
                     return True
+                self._trace.log_event(
+                    source="hands",
+                    event_type="action_executed",
+                    payload={"action": action, "decision": decision, "success": False, "reason": "missing_key"},
+                )
                 return False
 
             elif action == "hotkey":
@@ -506,31 +725,67 @@ Return ONE corrective action JSON only."""
                 if keys:
                     pyautogui.hotkey(*keys)
                     logger.info(f"Executed: hotkey {keys}")
+                    self._trace.log_event(
+                        source="hands",
+                        event_type="action_executed",
+                        payload={"action": action, "decision": decision, "success": True},
+                    )
                     return True
+                self._trace.log_event(
+                    source="hands",
+                    event_type="action_executed",
+                    payload={"action": action, "decision": decision, "success": False, "reason": "missing_keys"},
+                )
                 return False
 
             elif action == "scroll":
                 amount = decision.get("amount", -3)
                 pyautogui.scroll(amount)
                 logger.info(f"Executed: scroll {amount}")
+                self._trace.log_event(
+                    source="hands",
+                    event_type="action_executed",
+                    payload={"action": action, "decision": decision, "success": True},
+                )
                 return True
 
             elif action == "wait":
                 seconds = decision.get("seconds", 1)
                 time_module.sleep(seconds)
                 logger.info(f"Executed: wait {seconds}s")
+                self._trace.log_event(
+                    source="hands",
+                    event_type="action_executed",
+                    payload={"action": action, "decision": decision, "success": True},
+                )
                 return True
 
             elif action == "done":
                 logger.info("Executed: done (task complete)")
+                self._trace.log_event(
+                    source="hands",
+                    event_type="action_executed",
+                    payload={"action": action, "decision": decision, "success": True},
+                )
                 return True
 
             else:
                 logger.warning(f"Unknown action: {action}")
+                self._trace.log_event(
+                    source="hands",
+                    event_type="action_executed",
+                    payload={"action": action, "decision": decision, "success": False, "reason": "unknown_action"},
+                )
                 return False
 
         except Exception as e:
             logger.error(f"Execute error: {e}")
+            self._trace.log_exception(
+                source="hands",
+                event_type="action_execute_error",
+                exc=e,
+                payload={"decision": decision},
+            )
             return False
 
 

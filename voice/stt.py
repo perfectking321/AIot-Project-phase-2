@@ -15,23 +15,38 @@ import numpy as np
 
 logger = logging.getLogger("voxcode.stt")
 
-# Check for pyaudio
+# Check for pyaudio (or Windows drop-in pyaudiowpatch)
 try:
     import pyaudio
     PYAUDIO_AVAILABLE = True
     logger.debug("pyaudio available")
 except ImportError:
-    PYAUDIO_AVAILABLE = False
-    logger.warning("pyaudio not available")
+    try:
+        import pyaudiowpatch as pyaudio
+        PYAUDIO_AVAILABLE = True
+        logger.debug("pyaudiowpatch available (using as pyaudio)")
+    except ImportError:
+        PYAUDIO_AVAILABLE = False
+        logger.warning("pyaudio backend not available (tried pyaudio and pyaudiowpatch)")
 
-# Check for whisper
+# Prefer faster-whisper, fall back to openai-whisper
+try:
+    from faster_whisper import WhisperModel
+
+    FASTER_WHISPER_AVAILABLE = True
+    logger.debug("faster-whisper available")
+except ImportError:
+    FASTER_WHISPER_AVAILABLE = False
+    logger.warning("faster-whisper not available")
+
 try:
     import whisper
-    WHISPER_AVAILABLE = True
-    logger.debug("whisper available")
+
+    OPENAI_WHISPER_AVAILABLE = True
+    logger.debug("openai-whisper available")
 except ImportError:
-    WHISPER_AVAILABLE = False
-    logger.warning("whisper not available")
+    OPENAI_WHISPER_AVAILABLE = False
+    logger.warning("openai-whisper not available")
 
 # Import config
 import sys
@@ -203,115 +218,145 @@ class AudioRecorder:
 
 
 class SpeechToText:
-    """Whisper-based speech-to-text transcription."""
+    """Speech-to-text transcription with faster-whisper preferred."""
 
     def __init__(self, model_name: str = None, language: str = None, preload: bool = False):
-        if not WHISPER_AVAILABLE:
-            raise ImportError("openai-whisper required. Install: pip install openai-whisper")
+        if not FASTER_WHISPER_AVAILABLE and not OPENAI_WHISPER_AVAILABLE:
+            raise ImportError(
+                "Missing STT backend. Install faster-whisper (preferred) or openai-whisper."
+            )
 
         self.model_name = model_name or config.voice.whisper_model
         self.language = language or config.voice.whisper_language
         self.audio_gain = config.voice.audio_gain
+        self.compute_type = config.voice.whisper_compute_type
+        self.beam_size = max(1, int(config.voice.whisper_beam_size))
+        self.vad_filter = bool(config.voice.whisper_vad_filter)
+
         self._model = None
+        self._use_faster_whisper = False
         self._lock = threading.Lock()
 
-        logger.info(f"SpeechToText init: model={self.model_name}, lang={self.language}, gain={self.audio_gain}")
+        logger.info(
+            f"SpeechToText init: model={self.model_name}, lang={self.language}, "
+            f"gain={self.audio_gain}, beam={self.beam_size}, vad={self.vad_filter}"
+        )
 
-        # Preload model if requested (for faster first transcription)
         if preload:
             self._load_model()
 
     def _load_model(self):
-        """Load the Whisper model (called at init if preload=True, otherwise lazy-loaded)."""
-        if self._model is None:
-            with self._lock:
-                if self._model is None:
-                    logger.info(f"Loading Whisper model '{self.model_name}'...")
-                    self._model = whisper.load_model(self.model_name)
-                    logger.info("Whisper model loaded")
+        """Load STT model lazily. Prefer faster-whisper."""
+        if self._model is not None:
+            return
+
+        with self._lock:
+            if self._model is not None:
+                return
+
+            if FASTER_WHISPER_AVAILABLE:
+                logger.info(
+                    f"Loading faster-whisper model '{self.model_name}' (compute_type={self.compute_type})..."
+                )
+                self._model = WhisperModel(
+                    self.model_name,
+                    device="cpu",
+                    compute_type=self.compute_type,
+                )
+                self._use_faster_whisper = True
+                logger.info("faster-whisper model loaded")
+                return
+
+            logger.info(f"Loading openai-whisper model '{self.model_name}'...")
+            self._model = whisper.load_model(self.model_name)
+            self._use_faster_whisper = False
+            logger.info("openai-whisper model loaded")
+
+    def _prepare_audio(self, audio_data: bytes):
+        buffer = io.BytesIO(audio_data)
+        with wave.open(buffer, 'rb') as wf:
+            frames = wf.readframes(wf.getnframes())
+            sample_rate = wf.getframerate()
+            n_channels = wf.getnchannels()
+
+        audio_np = np.frombuffer(frames, dtype=np.int16)
+        if n_channels == 2:
+            audio_np = audio_np.reshape(-1, 2).mean(axis=1).astype(np.int16)
+
+        raw_level = np.abs(audio_np).mean()
+        raw_max = np.abs(audio_np).max() if len(audio_np) else 0
+        logger.info(f"Raw audio level: mean={raw_level:.0f}, max={raw_max}")
+
+        effective_gain = self.audio_gain
+        if raw_level < 50 and raw_max < 2000:
+            effective_gain = max(self.audio_gain, 10.0)
+            logger.info(f"Auto-boosting gain to {effective_gain}x (very quiet audio)")
+        elif raw_level < 100 and raw_max < 5000:
+            effective_gain = max(self.audio_gain, 8.0)
+            logger.info(f"Auto-boosting gain to {effective_gain}x (quiet audio)")
+
+        if effective_gain != 1.0:
+            audio_np = np.clip(audio_np.astype(np.float32) * effective_gain, -32768, 32767).astype(np.int16)
+            boosted_level = np.abs(audio_np).mean()
+            logger.info(f"After {effective_gain}x gain: level={boosted_level:.0f}")
+
+        audio_float = audio_np.astype(np.float32) / 32768.0
+        duration = len(audio_float) / sample_rate if sample_rate else 0.0
+        audio_level = np.abs(audio_float).mean() if len(audio_float) else 0.0
+
+        logger.info(f"Audio duration: {duration:.2f}s, samples: {len(audio_float)}")
+        logger.info(f"Normalized audio level: {audio_level:.4f}")
+        if audio_level < 0.005:
+            logger.warning("Audio appears to be silent or very quiet")
+
+        return audio_float, duration
 
     def transcribe(self, audio_data: bytes) -> TranscriptionResult:
-        """Transcribe audio data to text."""
+        """Transcribe WAV bytes to text."""
         logger.info(f"Transcribing {len(audio_data)} bytes of audio...")
+        if not audio_data:
+            return TranscriptionResult(text="", language=self.language, confidence=0.0, duration=0.0)
 
         self._load_model()
 
-        # Convert WAV bytes to numpy array
-        buffer = io.BytesIO(audio_data)
         try:
-            with wave.open(buffer, 'rb') as wf:
-                frames = wf.readframes(wf.getnframes())
-                sample_rate = wf.getframerate()
-                n_channels = wf.getnchannels()
-
-                # Convert to numpy
-                audio_np = np.frombuffer(frames, dtype=np.int16)
-
-                # If stereo, convert to mono
-                if n_channels == 2:
-                    audio_np = audio_np.reshape(-1, 2).mean(axis=1).astype(np.int16)
-
-                # Check raw audio level
-                raw_level = np.abs(audio_np).mean()
-                raw_max = np.abs(audio_np).max()
-                logger.info(f"Raw audio level: mean={raw_level:.0f}, max={raw_max}")
-
-                # Auto-gain: if audio is very quiet, boost it more
-                effective_gain = self.audio_gain
-                if raw_level < 50 and raw_max < 2000:
-                    # Very quiet audio - use higher gain
-                    effective_gain = max(self.audio_gain, 10.0)
-                    logger.info(f"Auto-boosting gain to {effective_gain}x (very quiet audio)")
-                elif raw_level < 100 and raw_max < 5000:
-                    # Quiet audio - use moderate boost
-                    effective_gain = max(self.audio_gain, 8.0)
-                    logger.info(f"Auto-boosting gain to {effective_gain}x (quiet audio)")
-
-                # Apply gain to amplify quiet audio
-                if effective_gain != 1.0:
-                    audio_np = np.clip(audio_np.astype(np.float32) * effective_gain, -32768, 32767).astype(np.int16)
-                    boosted_level = np.abs(audio_np).mean()
-                    logger.info(f"After {effective_gain}x gain: level={boosted_level:.0f}")
-
-                # Normalize to float32 [-1, 1]
-                audio_float = audio_np.astype(np.float32) / 32768.0
-                duration = len(audio_float) / sample_rate
-
-                logger.info(f"Audio duration: {duration:.2f}s, samples: {len(audio_float)}")
-
-                # Check if audio has content (not just silence)
-                audio_level = np.abs(audio_float).mean()
-                logger.info(f"Normalized audio level: {audio_level:.4f}")
-
-                if audio_level < 0.005:
-                    logger.warning("Audio appears to be silent or very quiet")
-                    # Still try to transcribe, Whisper might pick something up
-
-        except Exception as e:
-            logger.error(f"Error processing audio: {e}")
+            audio_float, duration = self._prepare_audio(audio_data)
+        except Exception as exc:
+            logger.error(f"Error processing audio: {exc}")
             return TranscriptionResult(text="", language=self.language, confidence=0.0, duration=0.0)
 
-        # Transcribe with Whisper
-        logger.info("Running Whisper transcription...")
+        logger.info("Running transcription...")
         try:
-            result = self._model.transcribe(
-                audio_float,
-                language=self.language,
-                fp16=False,  # Use fp32 for CPU compatibility
-                verbose=False
-            )
+            if self._use_faster_whisper:
+                kwargs = {
+                    "language": self.language,
+                    "beam_size": self.beam_size,
+                    "best_of": self.beam_size,
+                    "vad_filter": self.vad_filter,
+                }
+                if self.vad_filter:
+                    kwargs["vad_parameters"] = {"min_silence_duration_ms": 300}
 
-            text = result["text"].strip()
-            detected_lang = result.get("language", self.language)
+                segments, info = self._model.transcribe(audio_float, **kwargs)
+                text = " ".join(segment.text.strip() for segment in segments).strip()
+                detected_lang = getattr(info, "language", self.language)
+            else:
+                result = self._model.transcribe(
+                    audio_float,
+                    language=self.language,
+                    fp16=False,
+                    verbose=False,
+                )
+                text = result["text"].strip()
+                detected_lang = result.get("language", self.language)
 
             logger.info(f"Transcription result: '{text}' (lang={detected_lang})")
-
             return TranscriptionResult(
                 text=text,
                 language=detected_lang,
                 confidence=1.0,
-                duration=duration
+                duration=duration,
             )
-        except Exception as e:
-            logger.error(f"Whisper transcription failed: {e}")
+        except Exception as exc:
+            logger.error(f"Transcription failed: {exc}")
             return TranscriptionResult(text="", language=self.language, confidence=0.0, duration=0.0)

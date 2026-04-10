@@ -62,6 +62,55 @@ AVAILABLE_TOOLS = """
 
 - find_text: Find text position without clicking
   params: {"text": "Search"}
+
+### DOM BROWSER (read/interact with actual page content — requires Chrome on port 9222)
+- dom_read_page: Read current page title, URL, and body text
+  params: {}
+  RETURNS: {title, url, body_text}
+  USE THIS after navigating to a page to READ what it contains
+
+- dom_search_extract: Search Google and get results as structured JSON
+  params: {"query": "your search query"}
+  RETURNS: [{title, link, snippet}, ...] — ACTUAL TEXT from results
+  USE THIS instead of blind keyboard search when you need to READ results
+
+- dom_click: Click element by text or CSS selector
+  params: {"text": "Login"} OR {"selector": "button.submit"}
+  USE THIS for precise clicking without coordinate guessing
+
+- dom_fill: Fill a form input field
+  params: {"selector": "#email", "value": "user@example.com"}
+  OR: {"by_label": "Email", "value": "user@example.com"}
+
+- dom_extract: Run JavaScript in browser to extract custom data
+  params: {"js_code": "document.title"}
+
+- dom_wait: Wait for element to appear or page to finish loading
+  params: {"selector": ".results", "timeout": 10000}
+  OR: {"wait_for": "networkidle"}
+
+### SYSTEM (root-level Windows control — direct PowerShell access)
+- system_command: Run any PowerShell command
+  params: {"command": "Get-Process | Sort CPU -Desc | Select -First 5"}
+
+- network_info: Get IP addresses, adapters, flush DNS
+  params: {"action": "ip"} OR {"action": "dns_flush"} OR {"action": "wifi"}
+
+- brightness_control: Set screen brightness
+  params: {"level": "max"} OR {"level": "min"} OR {"level": "50"}
+
+- bluetooth_control: Toggle Bluetooth
+  params: {"action": "on"} OR {"action": "off"} OR {"action": "status"}
+
+- process_manager: Manage processes
+  params: {"action": "list", "sort_by": "cpu"}
+  OR: {"action": "kill", "name": "chrome"}
+
+- system_info: CPU/RAM/disk usage
+  params: {}
+
+- window_manager: Window control
+  params: {"action": "list"} OR {"action": "focus", "window_title": "Chrome"}
 """
 
 

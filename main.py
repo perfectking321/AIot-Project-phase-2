@@ -8,6 +8,11 @@ import sys
 import argparse
 import logging
 import os
+import threading
+from queue import Empty, Queue
+from logging.handlers import RotatingFileHandler
+
+from config import config
 
 # Fix Windows console encoding
 if sys.platform == 'win32':
@@ -21,27 +26,57 @@ if sys.platform == 'win32':
 
 def setup_logging(debug: bool = False):
     """Configure logging - file only for clean TUI."""
-    level = logging.DEBUG if debug else logging.INFO
+    level = logging.DEBUG
+    log_file = config.log_file or "voxcode.log"
 
     # File handler only - TUI handles console output
     file_formatter = logging.Formatter(
         "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     )
 
-    file_handler = logging.FileHandler("voxcode.log", mode='a', encoding='utf-8')
+    file_handler = RotatingFileHandler(
+        log_file,
+        mode='a',
+        maxBytes=8 * 1024 * 1024,
+        backupCount=3,
+        encoding='utf-8',
+    )
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(file_formatter)
 
     # Root logger - file only
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.DEBUG)
+
+    # Ensure clean handler setup if logging is initialized multiple times
+    for existing in list(root_logger.handlers):
+        root_logger.removeHandler(existing)
+        try:
+            existing.close()
+        except Exception:
+            pass
+
     root_logger.addHandler(file_handler)
 
-    # Suppress verbose loggers
+    # Suppress only noisy network loggers; keep VoxCode components visible
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("voxcode.omniparser").setLevel(logging.WARNING)
-    logging.getLogger("voxcode.vision").setLevel(logging.WARNING)
+    logging.getLogger("voxcode.omniparser").setLevel(logging.INFO)
+    logging.getLogger("voxcode.vision").setLevel(logging.INFO)
+
+    # Trace the logger initialization itself for deterministic debugging.
+    try:
+        from agent.trace import get_trace_logger
+
+        trace = get_trace_logger()
+        trace.log_event(
+            source="main",
+            event_type="logging_initialized",
+            payload={"debug": debug, "level": logging.getLevelName(level), "log_file": log_file},
+        )
+    except Exception:
+        # Logging must remain robust even if trace initialization fails.
+        pass
 
     return logging.getLogger("voxcode")
 
@@ -61,18 +96,26 @@ def check_dependencies():
         logger.error("[MISSING] textual")
 
     try:
-        import pyaudio
+        import pyaudio  # type: ignore
         logger.debug("[OK] pyaudio")
     except ImportError:
-        missing.append("pyaudio")
-        logger.error("[MISSING] pyaudio")
+        try:
+            import pyaudiowpatch as pyaudio  # type: ignore
+            logger.debug("[OK] pyaudiowpatch")
+        except ImportError:
+            missing.append("pyaudio/pyaudiowpatch")
+            logger.error("[MISSING] pyaudio and pyaudiowpatch")
 
     try:
-        import whisper
-        logger.debug("[OK] whisper")
+        from faster_whisper import WhisperModel  # noqa: F401
+        logger.debug("[OK] faster-whisper")
     except ImportError:
-        missing.append("openai-whisper")
-        logger.error("[MISSING] openai-whisper")
+        try:
+            import whisper  # noqa: F401
+            logger.warning("[WARN] Using openai-whisper (slower). Install faster-whisper for better speed.")
+        except ImportError:
+            missing.append("faster-whisper or openai-whisper")
+            logger.error("[MISSING] faster-whisper and openai-whisper")
 
     try:
         import pyautogui
@@ -127,18 +170,132 @@ def check_ollama():
         return False
 
 
+def check_models():
+    """Verify all tiered role models are pulled in Ollama."""
+    logger = logging.getLogger("voxcode.startup")
+
+    if config.llm.provider != "ollama":
+        return  # Only relevant for Ollama
+
+    required_models = {
+        "planner": config.llm.planner_model,
+        "executor": config.llm.executor_model,
+        "verifier": config.llm.verifier_model,
+        "fast": config.llm.fast_model,
+    }
+
+    try:
+        import requests
+        resp = requests.get(f"{config.llm.ollama_host}/api/tags", timeout=5)
+        if resp.status_code != 200:
+            logger.warning("Could not query Ollama models")
+            return
+
+        pulled_models = set()
+        for m in resp.json().get("models", []):
+            name = m.get("name", "")
+            pulled_models.add(name)
+            # Also add without tag for matching
+            base = name.split(":")[0] if ":" in name else name
+            pulled_models.add(base)
+
+        missing = []
+        for role, model in required_models.items():
+            # Check both exact name and base name
+            base = model.split(":")[0] if ":" in model else model
+            if model not in pulled_models and base not in pulled_models:
+                missing.append((role, model))
+
+        if missing:
+            print("\n[!] Missing tiered models:")
+            for role, model in missing:
+                print(f"    {role}: {model}  →  ollama pull {model}")
+            logger.warning(f"Missing models: {missing}")
+        else:
+            unique_models = set(required_models.values())
+            logger.info(f"[OK] All tiered models available: {unique_models}")
+            print(f"[OK] Tiered models: {', '.join(sorted(unique_models))}")
+
+    except Exception as e:
+        logger.warning(f"Could not verify models: {e}")
+
+
+def check_admin():
+    """Check and display admin privilege status."""
+    logger = logging.getLogger("voxcode.startup")
+    try:
+        from agent.skills.system_skills import IS_ADMIN
+        if IS_ADMIN:
+            print("[OK] Running with Administrator privileges ✓")
+            logger.info("Running with Administrator privileges")
+        else:
+            print("[!] Running WITHOUT Administrator privileges")
+            print("    Some system skills (bluetooth, services) may be limited.")
+            print("    To enable full access: right-click → Run as administrator")
+            logger.warning("Running without Administrator privileges")
+    except Exception as e:
+        logger.debug(f"Admin check skipped: {e}")
+
+
 def run_tui():
     """Run the TUI application."""
     logger = logging.getLogger("voxcode")
     logger.info("Starting TUI...")
 
+    from agent.dispatcher import get_dispatcher
     from tui.app import VoxcodeApp
-    app = VoxcodeApp()
-    app.run()
+
+    dispatcher = get_dispatcher(
+        on_message=lambda message: logger.info(f"Dispatcher: {message}"),
+        on_state_change=lambda state: logger.debug(f"Dispatcher state: {state}"),
+    )
+    dispatcher.start()
+
+    command_queue: Queue = Queue()
+    stop_event = threading.Event()
+
+    def _queue_worker():
+        while not stop_event.is_set():
+            try:
+                command = command_queue.get(timeout=0.2)
+            except Empty:
+                continue
+
+            if command is None:
+                break
+            dispatcher.submit(command)
+
+    queue_thread = threading.Thread(target=_queue_worker, daemon=True, name="ptt-command-queue")
+    queue_thread.start()
+
+    ptt_listener = None
+    if config.voice.enable_ptt_listener:
+        try:
+            from voice.ptt_listener import PTTListener
+
+            ptt_listener = PTTListener(
+                on_command=lambda text: command_queue.put(text),
+                hotkey=config.voice.ptt_hotkey,
+            )
+            ptt_listener.start()
+            logger.info("PTT listener started for run_tui")
+        except Exception as exc:
+            logger.info(f"PTT listener unavailable: {exc}")
+
+    try:
+        app = VoxcodeApp(dispatcher=dispatcher)
+        app.run()
+    finally:
+        if ptt_listener:
+            ptt_listener.stop()
+        stop_event.set()
+        command_queue.put(None)
+        queue_thread.join(timeout=2.0)
+        dispatcher.stop()
 
 
 def run_cli(command: str):
-    """Run a single command in CLI mode using stateful planning + pipeline."""
+    """Run a single command in CLI mode via the unified dispatcher."""
     logger = logging.getLogger("voxcode")
     logger.info(f"CLI mode: {command}")
 
@@ -146,14 +303,10 @@ def run_cli(command: str):
         print(f"  -> {msg}")
         logger.info(f"Agent: {msg}")
 
-    from brain.planner import get_planner
-    from agent.pipeline import get_pipeline
+    from agent.dispatcher import get_dispatcher
 
-    planner = get_planner()
-    plan = planner.create_plan(command, "CLI mode - no explicit screen context")
-    pipeline = get_pipeline(on_status=on_message)
-
-    result = pipeline.run_task_plan(plan, on_status=on_message)
+    dispatcher = get_dispatcher(on_message=on_message)
+    result = dispatcher.dispatch(command)
 
     print(f"\n[OK] Result: {result}")
     logger.info(f"Result: {result}")
@@ -175,6 +328,27 @@ def main():
     logger.info("VOXCODE Starting")
     logger.info("=" * 50)
 
+    try:
+        from agent.system_context import SystemContextProvider
+        SystemContextProvider().start()
+    except Exception as e:
+        logger.error(f"Failed to start SystemContextProvider: {e}")
+
+    try:
+        from agent.trace import get_trace_logger
+
+        get_trace_logger().log_event(
+            source="main",
+            event_type="startup",
+            payload={
+                "debug": args.debug,
+                "mode": "cli" if bool(args.command) else "tui",
+                "check_only": args.check,
+            },
+        )
+    except Exception:
+        pass
+
     if args.check:
         deps_ok = check_dependencies()
         ollama_ok = check_ollama()
@@ -189,6 +363,12 @@ def main():
 
     # Check Ollama (warning only, don't exit)
     check_ollama()
+
+    # Verify tiered models are available
+    check_models()
+
+    # Show privilege level
+    check_admin()
 
     if args.command:
         run_cli(args.command)

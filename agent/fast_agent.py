@@ -13,7 +13,7 @@ from enum import Enum
 from PIL import Image
 import json
 
-from brain.llm import get_llm_client
+from brain.llm import get_model_for_role
 from config import config
 
 logger = logging.getLogger("voxcode.fast_agent")
@@ -110,7 +110,7 @@ AVAILABLE ACTIONS:
     ):
         self.vision = vision
         self.tools = tools
-        self.llm = get_llm_client()
+        self.llm = get_model_for_role("fast")
         self.on_status = on_status or (lambda x: None)
         self.on_step = on_step or (lambda n, msg, status: None)
 
@@ -137,10 +137,10 @@ AVAILABLE ACTIONS:
         window_title = ""
         try:
             win = gw.getActiveWindow()
-            if win:
+            if win and hasattr(win, "title"):
                 window_title = win.title or ""
                 active_window = window_title.split(" - ")[-1] if " - " in window_title else window_title
-        except:
+        except Exception:
             pass
 
         # Detect screen type and elements using vision/OmniParser

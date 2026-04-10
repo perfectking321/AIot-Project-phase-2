@@ -52,8 +52,10 @@ class VoxcodeApp(App):
         Binding("ctrl+l", "clear_log", "Clear"),
     ]
 
-    def __init__(self):
+    def __init__(self, dispatcher=None):
         super().__init__()
+        self.dispatcher = dispatcher
+        self._owns_dispatcher = dispatcher is None
         self.recorder = None
         self.stt = None
         self.vision = None
@@ -61,6 +63,15 @@ class VoxcodeApp(App):
         self.global_hotkey = None
         self._toggle_in_progress = False  # Prevent re-entry
         self._current_agent = None  # Track current agent for cleanup
+        self._trace = None
+
+    def _get_trace(self):
+        """Lazy-load trace logger to avoid startup coupling."""
+        if self._trace is None:
+            from agent.trace import get_trace_logger
+
+            self._trace = get_trace_logger()
+        return self._trace
 
     def _init_voice(self):
         """Initialize voice components."""
@@ -217,6 +228,10 @@ class VoxcodeApp(App):
             self._current_agent.stop()
             logger.info("Agent stopped on exit")
 
+        if self.dispatcher and self._owns_dispatcher:
+            self.dispatcher.stop()
+            logger.info("Dispatcher stopped on exit")
+
         # Cleanup recorder
         if self.recorder:
             try:
@@ -291,18 +306,37 @@ class VoxcodeApp(App):
             self.set_status("Ready")
 
     async def _execute_command(self, command: str) -> None:
-        """Execute command using the hybrid state-aware architecture.
-
-        Flow:
-        1. Planner Brain: API-aware state hierarchy + subtasks
-        2. Eyes + Hands: perceive and decide action per subtask
-        3. Verifier + reactive correction: validate transition and self-correct
-        """
-        self.set_status(f"Analyzing command...")
+        """Execute command via the unified dispatcher."""
+        self.set_status("Dispatching command...")
         self.log_info("")
+        self.log_status("Dispatcher: routing command")
 
-        # All commands now use the unified pipeline
-        await self._execute_desktop_command(command)
+        try:
+            dispatcher = self._ensure_dispatcher()
+            result = await asyncio.to_thread(dispatcher.dispatch, command)
+
+            self.log_info("")
+            if any(term in result.lower() for term in ["failed", "error", "could not", "incomplete"]):
+                self.log_warning(f"⚠ {result}")
+            else:
+                self.log_success(f"✓ {result}")
+        except Exception as e:
+            self.log_error(f"Command execution failed: {e}")
+            logger.error(f"Dispatcher execution error: {e}", exc_info=True)
+        finally:
+            self.set_status("Ready")
+
+    def _ensure_dispatcher(self):
+        if self.dispatcher is None:
+            from agent.dispatcher import get_dispatcher
+
+            self.dispatcher = get_dispatcher(
+                on_message=lambda msg: self.log_status(msg),
+                on_state_change=lambda state: self.set_status(state),
+            )
+            self.dispatcher.start()
+            self._owns_dispatcher = True
+        return self.dispatcher
 
     async def _execute_browser_command(self, command: str) -> None:
         """Execute browser task using normal Chrome browser (no special setup required)."""
@@ -359,6 +393,18 @@ class VoxcodeApp(App):
         self.set_status("Planning state hierarchy...")
         self.log_status("Planning Brain -> API-aware state hierarchy + subtasks")
 
+        trace = self._get_trace()
+        trace.start_run(
+            source="tui",
+            goal=command,
+            metadata={"entrypoint": "voice", "mode": "desktop"},
+        )
+        trace.log_event(
+            source="tui",
+            event_type="voice_command_received",
+            payload={"command": command},
+        )
+
         try:
             from brain.planner import get_planner
             from agent.pipeline import get_pipeline
@@ -375,11 +421,30 @@ class VoxcodeApp(App):
                 pass
 
             self.log_info(f"[dim]Active window: {active_win or 'Unknown'}[/]")
+            trace.log_event(
+                source="tui",
+                event_type="active_window_detected",
+                payload={"active_window": active_win or "Unknown"},
+            )
 
             task_plan = await asyncio.to_thread(
                 planner.create_plan,
                 command,
                 active_win or "No active window detected",
+            )
+
+            trace.log_event(
+                source="tui",
+                event_type="planner_plan_created",
+                payload={
+                    "goal": command,
+                    "initial_state": task_plan.initial_state,
+                    "goal_state": task_plan.goal_state,
+                    "intermediate_states": task_plan.intermediate_states,
+                    "relevant_api_ids": [api.get("id") for api in task_plan.relevant_apis],
+                    "subtask_count": len(task_plan.subtasks),
+                    "subtasks": [subtask.to_dict() for subtask in task_plan.subtasks],
+                },
             )
 
             self.log_info("\n[bold]State Hierarchy:[/]")
@@ -400,12 +465,24 @@ class VoxcodeApp(App):
 
             if not task_plan.subtasks:
                 self.log_warning("Planner returned no subtasks")
+                trace.log_event(
+                    source="tui",
+                    event_type="planner_plan_empty",
+                    payload={"goal": command},
+                )
                 self.set_status("Ready")
                 return
 
         except Exception as e:
             self.log_error(f"Planning failed: {e}")
+            self.log_warning("Planner unavailable. Please retry your command once Ollama model is ready.")
             logger.error(f"Planning error: {e}", exc_info=True)
+            trace.log_exception(
+                source="tui",
+                event_type="planner_plan_failed",
+                exc=e,
+                payload={"goal": command},
+            )
             self.set_status("Ready")
             return
 
@@ -437,6 +514,16 @@ class VoxcodeApp(App):
                 on_step,
             )
 
+            trace.log_event(
+                source="tui",
+                event_type="pipeline_run_completed",
+                payload={
+                    "goal": command,
+                    "result": result,
+                    "stats": pipeline.get_stats() if hasattr(pipeline, "get_stats") else {},
+                },
+            )
+
             # Clear agent reference
             self._current_agent = None
 
@@ -449,6 +536,12 @@ class VoxcodeApp(App):
         except Exception as e:
             self.log_error(f"Pipeline error: {e}")
             logger.error(f"Pipeline error", exc_info=True)
+            trace.log_exception(
+                source="tui",
+                event_type="pipeline_run_failed",
+                exc=e,
+                payload={"goal": command},
+            )
 
         self._current_agent = None
         self.set_status("Ready")
@@ -464,11 +557,11 @@ class VoxcodeApp(App):
 
 def run_app():
     """Run the VOXCODE TUI."""
-    # Suppress verbose logging to console
-    logging.getLogger("voxcode.omniparser").setLevel(logging.WARNING)
-    logging.getLogger("voxcode.vision").setLevel(logging.WARNING)
-    logging.getLogger("voxcode.tools").setLevel(logging.WARNING)
-    logging.getLogger("voxcode.planner").setLevel(logging.WARNING)
+    # Keep component logs visible for debugging in file output.
+    logging.getLogger("voxcode.omniparser").setLevel(logging.INFO)
+    logging.getLogger("voxcode.vision").setLevel(logging.INFO)
+    logging.getLogger("voxcode.tools").setLevel(logging.INFO)
+    logging.getLogger("voxcode.planner").setLevel(logging.INFO)
 
     app = VoxcodeApp()
     app.run()

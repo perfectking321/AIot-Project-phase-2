@@ -84,11 +84,12 @@ class AgentLoop:
 
         # PLANNING phase
         self._set_state(AgentState.PLANNING)
+        context_summary = self._get_context_summary()
         self.on_message(f"Planning: {command}")
         logger.info("Creating plan...")
 
         try:
-            plan = self.planner.create_plan(command, self._get_context_summary())
+            plan = self.planner.create_plan(command, context_summary)
             self.context.current_plan = plan
             logger.info(f"Plan created: {len(plan.steps)} steps")
 
@@ -107,6 +108,18 @@ class AgentLoop:
 
         step_count = len(plan.steps)
         self.on_message(f"Plan created with {step_count} steps")
+
+        if step_count > 8 and config.agent.use_reactive_for_complex:
+            logger.info(f"Complex plan ({step_count} steps) - routing to ReactiveAgent")
+            self.on_message(f"Complex task detected ({step_count} steps). Switching to reactive mode.")
+            from agent.reactive_loop import ReactiveAgent
+
+            reactive = ReactiveAgent(
+                on_message=self.on_message,
+                max_iterations=config.agent.reactive_max_iterations,
+                verify_actions=config.agent.verify_actions,
+            )
+            return reactive.process_goal(command)
 
         # EXECUTING phase
         self._set_state(AgentState.EXECUTING)

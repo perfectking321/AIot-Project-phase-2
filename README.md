@@ -12,6 +12,7 @@ VOXCODE is a local, privacy-first voice assistant that automates Windows tasks u
 - **Windows Automation** - Control apps, type, click, and more
 - **Registry-Backed App Launching** - 50+ web/system/app entries for smarter command routing
 - **Audit Logging** - Planner/verification/launcher events persisted to `audit_log.jsonl`
+- **Unified Debug Trace** - Correlated per-run events + screenshots for planner, pipeline, Qwen, and verifier
 - **Terminal UI** - Beautiful TUI built with Textual
 
 ## Installation
@@ -96,6 +97,15 @@ Environment variables:
 - LLM_PROVIDER - LLM provider: ollama or groq
 - WHISPER_MODEL - Whisper model size (tiny/base/small/medium/large)
 - VOXCODE_DEBUG - Enable debug mode
+- VOXCODE_TRACE_ENABLED - Enable structured trace events (default: true)
+- VOXCODE_TRACE_SCREENSHOTS - Save trace screenshots (default: true)
+- VOXCODE_TRACE_SCREENSHOT_DIR - Base folder for per-run screenshots (default: screenshots/sessions)
+
+## Debug Artifacts
+
+- `voxcode.log` - Human-readable runtime log stream
+- `audit_log.jsonl` - Structured event timeline with `session_id`, `sequence`, planner/pipeline/hands/verifier payloads
+- `screenshots/sessions/<session_id>/` - Timestamped visual evidence captured before/after key actions
 
 ## Example Commands
 

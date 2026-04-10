@@ -6,6 +6,7 @@ Task decomposition and goal-oriented planning.
 import json
 import logging
 import time
+import re
 from typing import Optional, List, Dict, Any
 from dataclasses import dataclass, field
 from enum import Enum
@@ -14,8 +15,9 @@ from datetime import datetime
 
 logger = logging.getLogger("voxcode.brain.planner")
 
-from brain.llm import get_llm_client
+from brain.llm import get_llm_client, get_model_for_role, OllamaClient
 from brain.api_registry import APIRegistry
+from config import config
 
 
 class TaskStatus(Enum):
@@ -52,6 +54,7 @@ class Subtask:
     # Optional explicit state transition context
     input_state: str = ""
     output_state: str = ""
+    verify_condition: str = ""
 
     def to_dict(self) -> Dict:
         return {
@@ -64,6 +67,7 @@ class Subtask:
             "params": self.params,
             "input_state": self.input_state,
             "output_state": self.output_state,
+            "verify_condition": self.verify_condition,
         }
 
 
@@ -137,53 +141,37 @@ class HierarchicalPlanner:
     preconditions and postconditions.
     """
 
-    DECOMPOSE_PROMPT = """You are a state-aware planner for a Windows automation system.
+    DECOMPOSE_PROMPT = """You are a subgoal planner for a Windows desktop automation agent.
 
-Given a user goal, produce a hierarchical task plan with explicit states.
+The agent has a vision module (OmniParser) that reads the screen and finds UI elements at runtime.
+Your job is ONLY to produce a list of checkpoints from initial state to goal state.
+Do NOT specify click coordinates, element selectors, or low-level UI steps.
+Each subgoal has ONE job. The vision agent handles how to achieve it.
+
+For app launching, use action_type: "launch_app" with the app name.
+For navigation, use action_type: "navigate_to" with a URL.
+For input tasks, use action_type: "search" or "type_text" with the text.
+For interaction, use action_type: "click_target" with a description of what to click.
+
+Each subgoal must have a verify_condition: a single concrete thing visible on screen that confirms success.
 
 USER GOAL: {goal}
+CURRENT SCREEN: {screen_context}
+AVAILABLE APPS/APIS: {relevant_apis}
 
-CURRENT SCREEN CONTEXT:
-{screen_context}
-
-RELEVANT APIS (from registry):
-{relevant_apis}
-
-AVAILABLE ACTION TYPES:
-- ensure_app_open
-- navigate_to
-- click_element
-- type_text
-- send_message
-- search
-- wait
-- scroll
-- verify
-
-PLANNING RULES:
-1. Generate a state hierarchy: initial -> intermediate checkpoints -> goal.
-2. Each subtask must be atomic and represent one transition.
-3. Every subtask must include preconditions and postconditions.
-4. Use API registry data when the request references known services.
-5. If a condition may already be true, still include a safe verification-aware step.
-6. Keep output executable for UI automation.
-
-Respond with ONLY JSON in this shape:
+Respond ONLY with JSON:
 {
-  "initial_state": "what is true now",
-  "intermediate_states": ["checkpoint 1", "checkpoint 2"],
-  "goal_state": "final desired state",
-  "subtasks": [
-    {
-      "description": "what to do",
-      "action_type": "one_of_action_types",
-      "params": {"key": "value"},
-      "preconditions": ["..."],
-      "postconditions": ["..."],
-      "input_state": "optional explicit input state",
-      "output_state": "optional explicit output state"
-    }
-  ]
+    "initial_state": "one-line description of current screen",
+    "goal_state": "one-line description of final desired screen",
+    "subgoals": [
+        {
+            "id": 1,
+            "intent": "what this step achieves",
+            "action_type": "launch_app | navigate_to | search | type_text | click_target | verify",
+            "params": {"key": "value"},
+            "verify_condition": "what must be visible/true on screen after this step"
+        }
+    ]
 }"""
 
     REPLAN_PROMPT = """The current plan needs adjustment.
@@ -206,7 +194,7 @@ Respond with ONLY JSON in the same schema as planning."""
 
     def __init__(self, llm=None, api_registry: Optional[APIRegistry] = None):
         """Initialize planner."""
-        self.llm = llm or get_llm_client()
+        self.llm = llm or get_model_for_role("planner")
         self.api_registry = api_registry or APIRegistry()
         self.audit_path = Path("audit_log.jsonl")
 
@@ -284,6 +272,8 @@ Respond with ONLY JSON in the same schema as planning."""
                     "subtask_count": len(plan.subtasks),
                     "initial_state": plan.initial_state,
                     "goal_state": plan.goal_state,
+                    "intermediate_states": plan.intermediate_states,
+                    "subtasks": [subtask.to_dict() for subtask in plan.subtasks],
                 },
             )
             return plan
@@ -296,7 +286,7 @@ Respond with ONLY JSON in the same schema as planning."""
                     "error": str(e),
                 },
             )
-            return self._fallback_plan(goal, screen_context, apis)
+            raise RuntimeError(f"Planner failed: {e}") from e
 
     def plan(self, voice_command: str, screen_context: str = "No screen context available") -> TaskPlan:
         """Architecture-compatible alias for create_plan."""
@@ -531,39 +521,275 @@ REASON: [brief explanation]"""
                     cleaned.append(text)
         return cleaned
 
+    @staticmethod
+    def _is_symbolic_state_ref(value: str) -> bool:
+        """Detect placeholder-like state names that are not directly verifiable on screen."""
+        token = (value or "").strip().lower()
+        if not token:
+            return False
+        if token in {"initial_state", "goal_state", "current_state", "next_state", "input_state", "output_state"}:
+            return True
+        return bool(re.fullmatch(r"[a-z][a-z0-9_]*", token)) and "_" in token
+
+    def _resolve_state_ref(self, value: str, state_chain: List[str], index: int, fallback: str = "") -> str:
+        """Resolve symbolic state references into concrete text."""
+        text = (value or "").strip()
+        if not text:
+            return fallback
+
+        token = text.lower()
+        if token in {"initial_state", "current_state", "input_state"}:
+            if state_chain and index < len(state_chain):
+                return state_chain[index]
+            return fallback or text
+
+        if token in {"goal_state", "output_state", "next_state"}:
+            if state_chain and (index + 1) < len(state_chain):
+                return state_chain[index + 1]
+            if state_chain:
+                return state_chain[-1]
+            return fallback or text
+
+        if self._is_symbolic_state_ref(text):
+            return text.replace("_", " ")
+
+        return text
+
+    @staticmethod
+    def _normalize_action_type(action_type: str, description: str) -> str:
+        """Normalize planner action labels into executor-supported action types."""
+        raw = (action_type or "").strip().lower()
+        desc = (description or "").strip().lower()
+
+        aliases = {
+            "open_app": "launch_app",
+            "open_application": "launch_app",
+            "ensure_app_open": "launch_app",
+            "close_window": "click_target",
+            "click": "click_target",
+            "click_element": "click_target",
+            "type": "type_text",
+            "press": "click_target",
+            "open_url": "navigate_to",
+        }
+        raw = aliases.get(raw, raw)
+
+        if raw in {"launch_app", "navigate_to", "search", "type_text", "click_target", "verify"}:
+            return raw
+
+        if not raw or raw == "unknown":
+            if re.search(r"\b(open|launch|start)\b", desc):
+                return "launch_app"
+            if re.search(r"\b(navigate|go to|open url|visit|browse)\b", desc):
+                return "navigate_to"
+            if re.search(r"\b(search|find|look up)\b", desc):
+                return "search"
+            if re.search(r"\b(type|write|enter text)\b", desc):
+                return "type_text"
+            if re.search(r"\b(click|tap|select|open)\b", desc):
+                return "click_target"
+
+        return raw or "unknown"
+
     def _build_subtask(self, index: int, task_dict: Dict[str, Any], state_chain: List[str]) -> Subtask:
         """Create a normalized Subtask with state defaults."""
+        description = task_dict.get("intent") or task_dict.get("description") or f"Task {index + 1}"
+        verify_condition = str(task_dict.get("verify_condition", "") or "").strip()
         preconditions = self._normalize_condition_list(task_dict.get("preconditions", []))
         postconditions = self._normalize_condition_list(task_dict.get("postconditions", []))
 
         input_state = str(task_dict.get("input_state", "") or "").strip()
         output_state = str(task_dict.get("output_state", "") or "").strip()
 
+        default_input = state_chain[index] if state_chain and index < len(state_chain) else ""
+        default_output = state_chain[index + 1] if state_chain and index + 1 < len(state_chain) else ""
+
         # Fill missing state/condition links from the state chain.
         if not preconditions and state_chain and index < len(state_chain) - 1:
             preconditions = [state_chain[index]]
-        if not postconditions and state_chain and index + 1 < len(state_chain):
+        if verify_condition and not postconditions:
+            postconditions = [verify_condition]
+        elif not postconditions and state_chain and index + 1 < len(state_chain):
             postconditions = [state_chain[index + 1]]
+
+        preconditions = [
+            self._resolve_state_ref(condition, state_chain, index, fallback=default_input)
+            for condition in preconditions
+        ]
+        postconditions = [
+            self._resolve_state_ref(condition, state_chain, index, fallback=default_output)
+            for condition in postconditions
+        ]
+        preconditions = [condition for condition in preconditions if condition]
+        postconditions = [condition for condition in postconditions if condition]
 
         if not input_state and preconditions:
             input_state = preconditions[0]
         if not output_state and postconditions:
             output_state = postconditions[0]
+        if not output_state and verify_condition:
+            output_state = verify_condition
+
+        input_state = self._resolve_state_ref(input_state, state_chain, index, fallback=default_input)
+        output_state = self._resolve_state_ref(output_state, state_chain, index, fallback=default_output)
 
         params = task_dict.get("params", {})
         if not isinstance(params, dict):
             params = {}
 
+        normalized_action = self._normalize_action_type(task_dict.get("action_type", "unknown"), description)
+
+        # Fill missing critical params for deterministic action handlers.
+        if normalized_action == "launch_app" and not any(
+            isinstance(params.get(key), str) and params.get(key).strip()
+            for key in ("app_name", "path_or_name", "target", "application", "app")
+        ):
+            match = re.search(r"(?:open|launch|start|ensure)\s+([a-zA-Z0-9 ._:-]+)", description, flags=re.IGNORECASE)
+            if match:
+                candidate = re.split(
+                    r"\s+(?:and|then|to|for)\b",
+                    match.group(1).strip(" ."),
+                    maxsplit=1,
+                    flags=re.IGNORECASE,
+                )[0].strip()
+                candidate = re.split(r"\s+(?:is|are|with)\b", candidate, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+                params["app"] = self._canonicalize_app_name(candidate)
+
+        if normalized_action == "navigate_to" and not isinstance(params.get("url"), str):
+            url_match = re.search(r"(https?://\S+|www\.\S+|[a-zA-Z0-9.-]+\.(?:com|org|net|io|dev|ai))", description)
+            if url_match:
+                params["url"] = url_match.group(1).rstrip(".,")
+
+        if normalized_action == "search" and not isinstance(params.get("query"), str):
+            params["query"] = self._extract_type_text_from_goal(description) or description
+
+        if normalized_action == "type_text" and not isinstance(params.get("text"), str):
+            text_match = re.search(r"['\"]([^'\"]+)['\"]", description)
+            if text_match:
+                params["text"] = text_match.group(1).strip()
+
+        if normalized_action == "click_target" and not isinstance(params.get("target"), str):
+            params["target"] = description
+
         return Subtask(
             id=index + 1,
-            description=task_dict.get("description", f"Task {index + 1}"),
-            action_type=task_dict.get("action_type", "unknown"),
+            description=description,
+            action_type=normalized_action,
             preconditions=preconditions,
             postconditions=postconditions,
             params=params,
             input_state=input_state,
             output_state=output_state,
+            verify_condition=verify_condition or (postconditions[0] if postconditions else output_state),
         )
+
+    @staticmethod
+    def _extract_url_from_text(text: str) -> str:
+        """Extract URL-like target from text and normalize to https."""
+        match = re.search(
+            r"(https?://\S+|www\.\S+|[a-zA-Z0-9.-]+\.(?:com|org|net|io|dev|ai|co)(?:/\S*)?)",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            return ""
+
+        url = match.group(1).rstrip(".,)")
+        if not re.match(r"^https?://", url, flags=re.IGNORECASE):
+            url = f"https://{url}"
+        return url
+
+    @staticmethod
+    def _extract_type_text_from_goal(goal: str) -> str:
+        """Extract text payload from type/write style goals."""
+        quoted = re.search(r"(?:type|write|enter(?: text)?)\s+['\"]([^'\"]+)['\"]", goal, flags=re.IGNORECASE)
+        if quoted:
+            return quoted.group(1).strip()
+
+        typed = re.search(r"\b(?:type|write|enter(?: text)?)\b\s+(.+)", goal, flags=re.IGNORECASE)
+        if not typed:
+            return ""
+
+        text = typed.group(1).strip()
+        text = re.split(r"\s+(?:in|into|on|to|inside)\b", text, maxsplit=1, flags=re.IGNORECASE)[0]
+        text = text.strip(" .\"'")
+        return text
+
+    @staticmethod
+    def _canonicalize_app_name(name: str) -> str:
+        """Normalize user-facing app names to executable-friendly targets."""
+        raw = (name or "").strip()
+        if not raw:
+            return ""
+
+        normalized = re.sub(r"\s+", " ", raw).strip().lower()
+        normalized = re.sub(r"\b(application|app)\b", "", normalized).strip()
+
+        aliases = {
+            "notepad": "notepad.exe",
+            "calculator": "calc.exe",
+            "calc": "calc.exe",
+            "file explorer": "explorer.exe",
+            "explorer": "explorer.exe",
+            "command prompt": "cmd.exe",
+            "cmd": "cmd.exe",
+            "powershell": "powershell.exe",
+            "windows powershell": "powershell.exe",
+            "chrome": "chrome.exe",
+            "google chrome": "chrome.exe",
+            "edge": "msedge.exe",
+            "microsoft edge": "msedge.exe",
+            "vscode": "code.exe",
+            "visual studio code": "code.exe",
+        }
+
+        if normalized in aliases:
+            return aliases[normalized]
+
+        # Keep explicit executable/path targets untouched.
+        if raw.lower().endswith(".exe") or "\\" in raw or "/" in raw or ":" in raw:
+            return raw
+
+        return normalized or raw
+
+    def _infer_app_target(self, goal: str, relevant_apis: List[Dict[str, Any]]) -> str:
+        """Infer app target from command text and API registry hints."""
+        goal_text = (goal or "").strip()
+
+        match = re.search(
+            r"\b(?:open|launch|start|close|exit|quit)\s+([a-zA-Z0-9 ._:-]+)",
+            goal_text,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            candidate = match.group(1).strip(" .")
+            candidate = re.split(
+                r"\s+(?:and|then|to|for|with|in|on)\b",
+                candidate,
+                maxsplit=1,
+                flags=re.IGNORECASE,
+            )[0].strip(" .")
+            if candidate:
+                return self._canonicalize_app_name(candidate)
+
+        if re.search(r"\b([a-z]:\\|[a-z]\s*drive|folder|directory|file explorer|explorer)\b", goal_text, flags=re.IGNORECASE):
+            return "explorer.exe"
+
+        for api in relevant_apis or []:
+            api_id = str(api.get("id", "")).lower()
+            api_kind = str(api.get("kind", "")).lower()
+            if api_kind == "app" or api_id.startswith("app_"):
+                exe_name = api.get("exe_name")
+                if isinstance(exe_name, str) and exe_name.strip():
+                    return exe_name.strip()
+                api_name = api.get("name")
+                if isinstance(api_name, str) and api_name.strip():
+                    return self._canonicalize_app_name(api_name)
+
+        if re.search(r"\b(chrome|browser|youtube|google|website|web)\b", goal_text, flags=re.IGNORECASE):
+            return "chrome.exe"
+
+        return ""
 
     def _parse_task_plan(
         self,
@@ -603,7 +829,9 @@ REASON: [brief explanation]"""
                 or goal
             )
 
-            raw_subtasks = payload.get("subtasks", [])
+            raw_subtasks = payload.get("subgoals")
+            if not isinstance(raw_subtasks, list):
+                raw_subtasks = payload.get("subtasks", [])
             if isinstance(raw_subtasks, list):
                 subtasks_raw = [s for s in raw_subtasks if isinstance(s, dict)]
 
@@ -630,7 +858,7 @@ REASON: [brief explanation]"""
             plan.add_subtask(self._build_subtask(i, task_dict, state_chain))
 
         if not plan.subtasks:
-            return self._fallback_plan(goal, screen_context, relevant_apis)
+            raise ValueError("Planner returned no valid subgoals")
 
         if not plan.intermediate_states:
             derived = [t.output_state for t in plan.subtasks[:-1] if t.output_state]
@@ -647,7 +875,7 @@ REASON: [brief explanation]"""
         screen_context: str,
         relevant_apis: List[Dict[str, Any]],
     ) -> TaskPlan:
-        """Create a minimal safe fallback plan."""
+        """Create a deterministic fallback plan when LLM planning fails."""
         plan = TaskPlan(
             goal=goal,
             initial_state=screen_context,
@@ -655,15 +883,127 @@ REASON: [brief explanation]"""
             goal_state=goal,
             relevant_apis=relevant_apis,
         )
-        plan.add_subtask(Subtask(
-            id=1,
-            description=goal,
-            action_type="unknown",
-            preconditions=[screen_context] if screen_context else [],
-            postconditions=[goal],
-            input_state=screen_context,
-            output_state=goal,
-        ))
+
+        goal_text = (goal or "").strip()
+        goal_lower = goal_text.lower()
+        current_state = plan.initial_state or "Current desktop state"
+
+        def add_subtask(
+            description: str,
+            action_type: str,
+            params: Dict[str, Any],
+            output_state: str,
+            postconditions: List[str],
+            verify_condition: str,
+        ) -> None:
+            nonlocal current_state
+            preconditions = [current_state] if current_state else []
+            plan.add_subtask(
+                Subtask(
+                    id=len(plan.subtasks) + 1,
+                    description=description,
+                    action_type=action_type,
+                    preconditions=preconditions,
+                    postconditions=postconditions,
+                    params=params,
+                    input_state=current_state,
+                    output_state=output_state,
+                    verify_condition=verify_condition,
+                )
+            )
+            if output_state:
+                current_state = output_state
+
+        close_intent = bool(re.search(r"\b(close|exit|quit|minimi[sz]e)\b", goal_lower))
+        open_intent = bool(re.search(r"\b(open|launch|start)\b", goal_lower))
+        navigate_intent = bool(
+            re.search(r"\b(navigate|go to|visit|browse|open url|website|web)\b", goal_lower)
+        )
+        system_intent = bool(re.search(r"\b(mute|unmute|volume|brightness)\b", goal_lower))
+
+        app_target = self._infer_app_target(goal_text, relevant_apis)
+        url_target = self._extract_url_from_text(goal_text)
+        type_payload = self._extract_type_text_from_goal(goal_text)
+
+        if system_intent:
+            add_subtask(
+                description=goal_text,
+                action_type="click_target",
+                params={"target": goal_text},
+                output_state="System control command completed",
+                postconditions=["System control command completed"],
+                verify_condition="System control command completed",
+            )
+        else:
+            if close_intent:
+                target = app_target or "active window"
+                add_subtask(
+                    description=f"Close {target}",
+                    action_type="click_target",
+                    params={"target": target},
+                    output_state=f"{target} is closed",
+                    postconditions=[f"{target} is closed"],
+                    verify_condition=f"{target} is closed",
+                )
+            else:
+                if open_intent or (app_target and (navigate_intent or bool(type_payload))):
+                    target = app_target or "chrome.exe"
+                    add_subtask(
+                        description=f"Open {target}",
+                        action_type="launch_app",
+                        params={"app": target},
+                        output_state=f"{target} is open and active",
+                        postconditions=[f"{target} is open and active"],
+                        verify_condition=f"{target} window is visible",
+                    )
+
+                if navigate_intent:
+                    if not url_target and "youtube" in goal_lower:
+                        url_target = "https://youtube.com"
+                    elif not url_target and "google" in goal_lower:
+                        url_target = "https://google.com"
+
+                    if url_target:
+                        add_subtask(
+                            description=f"Navigate to {url_target}",
+                            action_type="navigate_to",
+                            params={"url": url_target},
+                            output_state=f"Browser navigated to {url_target}",
+                            postconditions=[f"{url_target} is visible in browser"],
+                            verify_condition=f"{url_target} page content is visible",
+                        )
+
+                if type_payload:
+                    add_subtask(
+                        description=f"Type '{type_payload}'",
+                        action_type="type_text",
+                        params={"text": type_payload},
+                        output_state=f"Text '{type_payload}' typed",
+                        postconditions=[f"Text '{type_payload}' typed"],
+                        verify_condition=f"Text '{type_payload}' is visible on screen",
+                    )
+
+        if not plan.subtasks:
+            add_subtask(
+                description=f"Wait before retrying unsafe fallback: {goal_text}",
+                action_type="verify",
+                params={"target": goal_text},
+                output_state="UI state stabilized",
+                postconditions=["UI state stabilized"],
+                verify_condition="UI state stabilized",
+            )
+
+        plan.intermediate_states = [subtask.output_state for subtask in plan.subtasks[:-1] if subtask.output_state]
+        plan.goal_state = plan.subtasks[-1].output_state if plan.subtasks else goal
+
+        self._audit_event(
+            "planner_fallback_plan_created",
+            {
+                "goal": goal,
+                "subtask_count": len(plan.subtasks),
+                "subtasks": [subtask.to_dict() for subtask in plan.subtasks],
+            },
+        )
         return plan
 
     def _parse_subtasks(self, response: str) -> List[Dict]:
@@ -723,11 +1063,93 @@ REASON: [brief explanation]"""
 _planner_instance: Optional[HierarchicalPlanner] = None
 
 
+def _model_name_matches(candidate: str, available_name: str) -> bool:
+    """Best-effort match between requested and installed Ollama model names."""
+    cand = (candidate or "").strip().lower()
+    avail = (available_name or "").strip().lower()
+    if not cand or not avail:
+        return False
+
+    if cand == avail:
+        return True
+
+    cand_parts = cand.split(":", 1)
+    avail_parts = avail.split(":", 1)
+
+    cand_base = cand_parts[0]
+    cand_tag = cand_parts[1] if len(cand_parts) > 1 else ""
+    avail_base = avail_parts[0]
+    avail_tag = avail_parts[1] if len(avail_parts) > 1 else ""
+
+    # Different model families should never match.
+    if cand_base != avail_base:
+        return False
+
+    # Untagged candidate can match any installed tag of the same base model.
+    if not cand_tag:
+        return True
+
+    # Tagged candidate must match exact tag.
+    return cand_tag == avail_tag
+
+
+def _resolve_planner_model_name() -> str:
+    """Resolve a usable local planner model, falling back to installed alternatives."""
+    planner_model = getattr(config.llm, "planner_model", config.llm.ollama_model)
+    candidates = []
+    for model_name in [
+        planner_model,
+        getattr(config.llm, "executor_model", ""),
+        config.llm.ollama_model,
+    ]:
+        model_name = (model_name or "").strip()
+        if model_name and model_name not in candidates:
+            candidates.append(model_name)
+
+    if not candidates:
+        return planner_model
+
+    try:
+        probe = OllamaClient(
+            host=config.llm.ollama_host,
+            model=candidates[0],
+            temperature=min(config.llm.temperature, 0.2),
+            max_tokens=config.llm.max_tokens,
+            timeout=min(config.llm.timeout, 5),
+        )
+        models = probe.list_models()
+        available_names = [m.get("name", "") for m in models if isinstance(m, dict)]
+
+        for candidate in candidates:
+            if any(_model_name_matches(candidate, name) for name in available_names):
+                return candidate
+
+        qwen_models = [name for name in available_names if "qwen" in name.lower()]
+        if qwen_models:
+            return qwen_models[0]
+    except Exception as exc:
+        logger.warning(f"Planner model resolution failed, using configured planner model: {exc}")
+
+    return planner_model
+
+
 def get_planner() -> HierarchicalPlanner:
     """Get or create global planner instance."""
     global _planner_instance
 
     if _planner_instance is None:
-        _planner_instance = HierarchicalPlanner()
+        try:
+            planner_model = _resolve_planner_model_name()
+            planner_llm = OllamaClient(
+                host=config.llm.ollama_host,
+                model=planner_model,
+                temperature=min(config.llm.temperature, 0.2),
+                max_tokens=config.llm.max_tokens,
+                timeout=config.llm.timeout,
+            )
+            _planner_instance = HierarchicalPlanner(llm=planner_llm)
+        except Exception as e:
+            logger.warning(f"Planner model initialization fallback triggered: {e}")
+            _planner_instance = HierarchicalPlanner()
 
     return _planner_instance

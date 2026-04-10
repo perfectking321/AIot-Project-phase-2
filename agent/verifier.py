@@ -13,6 +13,9 @@ from pathlib import Path
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 
+from brain.llm import OllamaClient, get_model_for_role
+from config import config
+
 logger = logging.getLogger("voxcode.verifier")
 
 # Audit log path
@@ -52,6 +55,8 @@ class Verifier:
         self.total_checks = 0
         self.changes_detected = 0
         self.no_changes_detected = 0
+
+        self._semantic_client = get_model_for_role("verifier")
 
         logger.info(
             f"Verifier initialized (threshold={change_threshold}, radius={check_radius})"
@@ -202,6 +207,44 @@ class Verifier:
         except Exception as e:
             logger.warning(f"Audit log write failed: {e}")
 
+    @staticmethod
+    def _elements_to_semantic_text(elements_seen: List[Any]) -> str:
+        """Render OmniParser elements into compact text for semantic checks."""
+        lines: List[str] = []
+        for idx, elem in enumerate(elements_seen or []):
+            if isinstance(elem, dict):
+                label = elem.get("label", "")
+                elem_type = elem.get("type", elem.get("element_type", "element"))
+                center = elem.get("center", ("?", "?"))
+            else:
+                label = getattr(elem, "label", "")
+                elem_type = getattr(elem, "element_type", "element")
+                center = getattr(elem, "center", ("?", "?"))
+            lines.append(f"[{idx}] {elem_type} '{label}' at {center}")
+        return "\n".join(lines)
+
+    def semantic_verify(self, verify_condition: str, elements_seen: List[Any]) -> bool:
+        """Check a verify_condition against current OmniParser elements using Ollama."""
+        condition = (verify_condition or "").strip()
+        if not condition:
+            return True
+
+        elements_text = self._elements_to_semantic_text(elements_seen)
+        prompt = f"""Screen elements:
+{elements_text}
+
+Condition to check: "{condition}"
+
+Is this condition met? Reply only: YES or NO"""
+
+        try:
+            response = self._semantic_client.generate(prompt)
+            answer = (response.content or "").strip().upper()
+            return answer.startswith("YES")
+        except Exception as e:
+            logger.warning(f"Semantic verify failed: {e}")
+            return False
+
     def verify_action(
         self,
         subgoal: str,
@@ -209,7 +252,12 @@ class Verifier:
         elements_seen: List[Any],
         before_region: Optional[np.ndarray],
         after_region: Optional[np.ndarray],
-        retry_count: int = 0
+        verify_condition: str = "",
+        retry_count: int = 0,
+        before_screenshot: Optional[str] = None,
+        after_screenshot: Optional[str] = None,
+        active_window: Optional[str] = None,
+        extra_context: Optional[Dict[str, Any]] = None,
     ) -> bool:
         """
         Full verify cycle. Returns True if action succeeded.
@@ -226,33 +274,42 @@ class Verifier:
         Returns:
             True if screen changed (action succeeded), False otherwise
         """
-        changed = self.did_screen_change(before_region, after_region)
+        condition = (verify_condition or subgoal or "").strip()
+        changed = bool(self.semantic_verify(condition, elements_seen))
 
-        # Calculate change percentage for logging
-        change_pct = 0.0
-        if before_region is not None and after_region is not None:
-            change_pct = self.get_change_percentage(before_region, after_region)
+        coord_x = decision.get("x")
+        coord_y = decision.get("y")
+        if coord_x is not None:
+            coord_x = int(coord_x)
+        if coord_y is not None:
+            coord_y = int(coord_y)
 
         # Build audit entry
         audit_entry = {
             "subgoal": subgoal,
             "decision": decision,
             "elements_count": len(elements_seen) if elements_seen else 0,
-            "pixel_changed": changed,
-            "change_percentage": round(change_pct, 2),
-            "retry_count": retry_count,
+            "semantic_condition": condition,
+            "semantic_verified": bool(changed),
+            "retry_count": int(retry_count),
             "action": decision.get("action"),
+            "active_window": active_window,
+            "before_screenshot": before_screenshot,
+            "after_screenshot": after_screenshot,
             "coords": {
-                "x": decision.get("x"),
-                "y": decision.get("y")
+                "x": coord_x,
+                "y": coord_y
             } if decision.get("action") == "click" else None
         }
+
+        if extra_context:
+            audit_entry["extra_context"] = extra_context
 
         self.audit_log(audit_entry)
 
         if not changed:
             logger.warning(
-                f"Action may have failed (no pixel change): "
+                f"Action may have failed (verify condition not met): "
                 f"{decision} for subgoal '{subgoal}'"
             )
 

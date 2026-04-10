@@ -33,8 +33,11 @@ huggingface_hub>=0.20.0
 
 # ==================== Voice ====================
 # STT (Speech-to-Text) - Whisper
+faster-whisper>=1.0.0
 openai-whisper>=20231117
-pyaudio>=0.2.14
+# Windows + Python 3.14: use prebuilt pyaudiowpatch wheels to avoid local C++ build errors.
+pyaudiowpatch>=0.2.12.8; platform_system == "Windows"
+pyaudio>=0.2.14; platform_system != "Windows"
 numpy>=1.24.0
 
 # TTS (Text-to-Speech)

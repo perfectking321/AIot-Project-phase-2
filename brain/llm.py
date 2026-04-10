@@ -68,6 +68,10 @@ class BaseLLMClient(ABC):
     def generate(self, prompt: str, system: str = None, stream: bool = False) -> LLMResponse:
         pass
 
+    def generate_short(self, prompt: str, system: str = None) -> LLMResponse:
+        """Generate a short response; defaults to standard generation."""
+        return self.generate(prompt=prompt, system=system, stream=False)
+
     @abstractmethod
     def chat(self, message: str, system: str = None, stream: bool = False, use_history: bool = True) -> LLMResponse:
         pass
@@ -136,6 +140,41 @@ class GroqClient(BaseLLMClient):
         response = self._make_request(messages)
         data = response.json()
 
+        content = data["choices"][0]["message"]["content"]
+        return LLMResponse(
+            content=content,
+            model=data.get("model", self.model),
+            done=True,
+            eval_count=data.get("usage", {}).get("completion_tokens")
+        )
+
+    def generate_short(self, prompt: str, system: str = None) -> LLMResponse:
+        """Generate a short response for action decisions — capped at 200 tokens."""
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+
+        # Override max_tokens for short responses
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": self.temperature,
+            "max_tokens": 200,  # Action decisions need ~80-150 tokens
+            "stream": False
+        }
+        response = requests.post(
+            f"{self.base_url}/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
+        data = response.json()
         content = data["choices"][0]["message"]["content"]
         return LLMResponse(
             content=content,
@@ -360,6 +399,28 @@ class OllamaClient(BaseLLMClient):
             eval_duration=data.get("eval_duration")
         )
 
+    def generate_short(self, prompt: str, system: str = None) -> LLMResponse:
+        """For single-action decisions - keep output short for lower latency."""
+        payload = {
+            "model": self.model,
+            "prompt": prompt,
+            "options": {"temperature": self.temperature, "num_predict": 150},
+            "stream": False,
+        }
+        if system:
+            payload["system"] = system
+
+        response = self._make_request("generate", payload)
+        data = response.json()
+        return LLMResponse(
+            content=data.get("response", ""),
+            model=data.get("model", self.model),
+            done=data.get("done", True),
+            total_duration=data.get("total_duration"),
+            eval_count=data.get("eval_count"),
+            eval_duration=data.get("eval_duration"),
+        )
+
     def chat(self, message: str, system: str = None, stream: bool = False, use_history: bool = True):
         if system and not any(m.role == "system" for m in self._conversation.messages):
             self._conversation.add("system", system)
@@ -436,15 +497,88 @@ class OllamaClient(BaseLLMClient):
                 yield json.loads(line)
 
 
-def get_llm_client() -> BaseLLMClient:
-    """Factory function to get the configured LLM client."""
-    if config.llm.provider == "groq":
-        return GroqClient()
-    else:
-        return OllamaClient()
+_llm_client_instance: Optional[BaseLLMClient] = None
+
+def get_llm_client(force_new: bool = False) -> BaseLLMClient:
+    """Factory function to get the configured LLM client based on config.llm.provider.
+    
+    Uses singleton pattern to avoid creating multiple HTTP sessions.
+    
+    Args:
+        force_new: If True, create a new client instance even if one exists
+        
+    Returns:
+        Configured LLM client (Groq or Ollama)
+    """
+    global _llm_client_instance
+    if _llm_client_instance is None or force_new:
+        provider = config.llm.provider.lower().strip()
+        if provider == "groq" and config.llm.allow_groq and config.llm.groq_api_key:
+            _llm_client_instance = GroqClient(
+                api_key=config.llm.groq_api_key,
+                model=config.llm.groq_model,
+                temperature=config.llm.temperature,
+                max_tokens=config.llm.max_tokens,
+                timeout=config.llm.timeout,
+            )
+        else:
+            _llm_client_instance = OllamaClient(
+                host=config.llm.ollama_host,
+                model=config.llm.ollama_model,
+                temperature=config.llm.temperature,
+                max_tokens=config.llm.max_tokens,
+                timeout=config.llm.timeout,
+            )
+    return _llm_client_instance
 
 
 # For backwards compatibility
 def create_client() -> BaseLLMClient:
     """Create LLM client based on config."""
     return get_llm_client()
+
+
+def get_model_for_role(role: str) -> BaseLLMClient:
+    """
+    Return an LLM client configured for a specific cognitive role.
+
+    Uses lighter, role-specific models to reduce total RAM usage.
+
+    Roles: "planner" | "executor" | "verifier" | "fast" | "general"
+    Falls back to groq if provider == "groq".
+    """
+    import logging
+    _logger = logging.getLogger("voxcode.llm")
+
+    # Groq has one model for all roles — no tiering needed
+    if config.llm.provider == "groq" and config.llm.allow_groq and config.llm.groq_api_key:
+        return get_llm_client()
+
+    role_model_map = {
+        "planner":  config.llm.planner_model,
+        "executor": config.llm.executor_model,
+        "verifier": config.llm.verifier_model,
+        "fast":     config.llm.fast_model,
+        "general":  config.llm.ollama_model,
+    }
+    model = role_model_map.get(role, config.llm.ollama_model)
+
+    try:
+        client = OllamaClient(
+            host=config.llm.ollama_host,
+            model=model,
+            temperature=config.llm.temperature,
+            max_tokens=config.llm.max_tokens,
+            timeout=config.llm.timeout,
+        )
+        _logger.debug(f"Created LLM client for role='{role}' using model='{model}'")
+        return client
+    except Exception as e:
+        _logger.warning(f"Failed to create client for role='{role}' model='{model}': {e}. Falling back to general.")
+        return OllamaClient(
+            host=config.llm.ollama_host,
+            model=config.llm.ollama_model,
+            temperature=config.llm.temperature,
+            max_tokens=config.llm.max_tokens,
+            timeout=config.llm.timeout,
+        )
