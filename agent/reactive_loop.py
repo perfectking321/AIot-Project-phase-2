@@ -90,12 +90,13 @@ GOAL: {goal}
 ACTIVE WINDOW: {active_window}
 VISIBLE APPS: {visible_apps}
 SCREEN ELEMENTS: {visible_elements}
+SYSTEM CONTEXT: {system_context}
 PREVIOUS ACTIONS:
 {action_history}
 
 AVAILABLE TOOLS — pick whichever one gets you closest to the goal:
 
-UI INTERACTION:
+UI INTERACTION (native desktop):
 - open_application  → {{"tool":"open_application","params":{{"path_or_name":"chrome"}}}}
 - click_text        → {{"tool":"click_text","params":{{"text":"Search"}}}}
 - type_text         → {{"tool":"type_text","params":{{"text":"hello world"}}}}
@@ -106,13 +107,25 @@ UI INTERACTION:
 - focus_window      → {{"tool":"focus_window","params":{{"title":"Chrome"}}}}
 - parse_screen      → {{"tool":"parse_screen","params":{{}}}}
 
-BROWSER DOM (requires Chrome on port 9222):
-- dom_search_extract → {{"tool":"dom_search_extract","params":{{"query":"search terms"}}}}
-  USE THIS to search Google and get real results as structured data
+BROWSER DOM (uses Playwright — auto-launches a browser):
+Workflow: ALWAYS call dom_observe FIRST, then use the ref_id to click/type.
+
+- dom_navigate       → {{"tool":"dom_navigate","params":{{"url":"https://youtube.com"}}}}
+  Navigate to a URL.
+- dom_observe        → {{"tool":"dom_observe","params":{{}}}}
+  List all interactive elements with ref_id. ALWAYS call this before clicking/typing.
+- dom_click_ref      → {{"tool":"dom_click_ref","params":{{"ref_id":5}}}}
+  Click element by ref_id (from dom_observe). Can also use {{"text":"link text"}}.
+- dom_type_ref       → {{"tool":"dom_type_ref","params":{{"ref_id":3,"text":"search query","press_enter":true}}}}
+  Type text into a field by ref_id (from dom_observe).
 - dom_read_page      → {{"tool":"dom_read_page","params":{{}}}}
-  USE THIS to read the actual text/URL of the current page
-- dom_click          → {{"tool":"dom_click","params":{{"text":"link or button text"}}}}
-- dom_fill           → {{"tool":"dom_fill","params":{{"by_label":"Search","value":"cats"}}}}
+  Read the current page title, URL, and body text.
+- dom_extract        → {{"tool":"dom_extract","params":{{"js_code":"document.title"}}}}
+  Run JavaScript in the browser and return the result.
+- dom_search_extract → {{"tool":"dom_search_extract","params":{{"query":"search terms"}}}}
+  Search Google and return top results as structured data.
+- dom_scroll         → {{"tool":"dom_scroll","params":{{"direction":"down","amount":500}}}}
+  Scroll the page.
 - dom_wait           → {{"tool":"dom_wait","params":{{"wait_for":"networkidle"}}}}
 
 SYSTEM / WINDOWS:
@@ -128,11 +141,12 @@ SYSTEM / WINDOWS:
 RULES:
 1. ONE action per response. Smallest useful step.
 2. If app already in VISIBLE APPS, do NOT open it again.
-3. Use dom_search_extract to SEARCH the web — never guess URLs.
-4. Use system_command to create/modify files: New-Item, Set-Content, etc.
-5. Use brightness_control for brightness — NOT system_command.
-6. Never repeat a failed action. Adapt.
-7. When the goal is fully achieved, signal completion.
+3. For web tasks: use dom_navigate + dom_observe + dom_click_ref/dom_type_ref.
+4. ALWAYS call dom_observe before using dom_click_ref or dom_type_ref.
+5. Use system_command to create/modify files: New-Item, Set-Content, etc.
+6. Use brightness_control for brightness — NOT system_command.
+7. Never repeat a failed action. Adapt.
+8. When the goal is fully achieved, signal completion.
 
 COMPLETION: Signal goal done with:
 {{"action":"GOAL_COMPLETE","tool":"none","params":{{}},"reason":"brief explanation of what was done"}}
@@ -334,12 +348,29 @@ JSON: {{"success":true/false,"goal_achieved":true/false,"reason":"brief"}}"""
         meaningful_elements = [e for e in state.visible_elements if e.lower() != "icon"][:15]
         elements_str = ", ".join(meaningful_elements) if meaningful_elements else "None detected"
 
+        # Inject system context for zero-latency state awareness
+        system_context_str = "N/A"
+        try:
+            from agent.system_context import get_system_context
+            ctx = get_system_context()
+            parts = []
+            if ctx.get("active_window"):
+                parts.append(f"Window: {ctx['active_window']}")
+            if ctx.get("battery"):
+                parts.append(f"Battery: {ctx['battery']}")
+            if ctx.get("clipboard"):
+                parts.append(f"Clipboard: {ctx['clipboard'][:50]}")
+            system_context_str = "; ".join(parts) if parts else "N/A"
+        except Exception:
+            pass
+
         # Build prompt
         prompt = self.DECIDE_ACTION_PROMPT.format(
             goal=goal,
             active_window=state.active_window or "Unknown",
             visible_apps=visible_apps_str,
             visible_elements=elements_str,
+            system_context=system_context_str,
             action_history=history_str
         )
 
@@ -391,8 +422,10 @@ JSON: {{"success":true/false,"goal_achieved":true/false,"reason":"brief"}}"""
                 known_tools = list(self.PARAM_ALIASES.keys()) + [
                     "click", "click_element_by_id", "parse_screen", "focus_window",
                     "take_screenshot", "find_text", "scroll", "none",
+                    "dom_observe", "dom_navigate", "dom_click_ref", "dom_type_ref",
                     "dom_search_extract", "dom_read_page", "dom_click", "dom_fill",
-                    "dom_extract", "dom_wait", "system_command", "brightness_control",
+                    "dom_extract", "dom_scroll", "dom_wait", "dom_accessibility",
+                    "system_command", "brightness_control",
                     "bluetooth_control", "network_info", "process_manager", "system_info",
                     "window_manager",
                 ]
@@ -501,13 +534,19 @@ JSON: {{"success":true/false,"goal_achieved":true/false,"reason":"brief"}}"""
             "duration": "seconds",
             "time": "seconds",
         },
-        # DOM browser skills
+        # DOM browser skills (v2 — Playwright managed browser)
+        "dom_observe": {},
+        "dom_navigate": {"link": "url", "page": "url", "site": "url"},
+        "dom_click_ref": {"element": "text", "label": "text", "target": "text", "id": "ref_id"},
+        "dom_type_ref": {"input": "text", "value": "text", "content": "text", "id": "ref_id"},
         "dom_search_extract": {"search": "query", "q": "query"},
         "dom_read_page": {},
         "dom_click": {"element": "text", "label": "text", "target": "text"},
         "dom_fill": {},
         "dom_extract": {"code": "js_code", "javascript": "js_code"},
+        "dom_scroll": {"dir": "direction"},
         "dom_wait": {},
+        "dom_accessibility": {},
         # System skills
         "brightness_control": {"value": "level", "brightness": "level"},
         "bluetooth_control": {},
@@ -596,37 +635,35 @@ JSON: {{"success":true/false,"goal_achieved":true/false,"reason":"brief"}}"""
         return ToolResult(ToolStatus.FAILURE, f"No fallback for tool: {tool}")
 
     def _execute_dom_tool(self, tool: str, params: Dict[str, Any]) -> ToolResult:
-        """Route to DOM browser skill classes. Ensures Chrome is available first."""
+        """Route to DOM browser skill classes.
+
+        Uses the BrowserSessionManager which auto-launches a Playwright
+        Chromium browser — no CDP debug port needed.
+        """
         try:
             from agent.skills.dom_browser_skills import (
-                DOMSearchExtractSkill, DOMReadPageSkill, DOMClickSkill,
-                DOMFillSkill, DOMExtractSkill, DOMWaitSkill, PLAYWRIGHT_AVAILABLE
+                DOMObserveSkill, DOMNavigateSkill, DOMClickRefSkill,
+                DOMTypeRefSkill, DOMSearchExtractSkill, DOMReadPageSkill,
+                DOMExtractSkill, DOMScrollSkill, DOMWaitSkill,
+                DOMAccessibilitySkill, DOMClickSkill, DOMFillSkill,
+                PLAYWRIGHT_AVAILABLE
             )
             if not PLAYWRIGHT_AVAILABLE:
                 return ToolResult(ToolStatus.FAILURE, "Playwright not installed. Run: pip install playwright && playwright install chromium")
 
-            # Check if Chrome CDP is reachable; if not, open Chrome with debug port
-            try:
-                import requests as _req
-                _req.get("http://localhost:9222/json/version", timeout=2)
-            except Exception:
-                logger.info("Chrome CDP not available — launching Chrome with debug port")
-                self.on_message("Opening Chrome for browser automation...")
-                import subprocess
-                bat_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "start_chrome_for_voxcode.bat")
-                if os.path.exists(bat_path):
-                    subprocess.Popen(bat_path, shell=True)
-                else:
-                    subprocess.Popen('start chrome --remote-debugging-port=9222', shell=True)
-                time.sleep(3)
-
             skill_map = {
+                "dom_observe": DOMObserveSkill,
+                "dom_navigate": DOMNavigateSkill,
+                "dom_click_ref": DOMClickRefSkill,
+                "dom_type_ref": DOMTypeRefSkill,
                 "dom_search_extract": DOMSearchExtractSkill,
                 "dom_read_page": DOMReadPageSkill,
-                "dom_click": DOMClickSkill,
-                "dom_fill": DOMFillSkill,
+                "dom_click": DOMClickSkill,       # backward compat
+                "dom_fill": DOMFillSkill,          # backward compat
                 "dom_extract": DOMExtractSkill,
+                "dom_scroll": DOMScrollSkill,
                 "dom_wait": DOMWaitSkill,
+                "dom_accessibility": DOMAccessibilitySkill,
             }
             cls = skill_map.get(tool)
             if not cls:
